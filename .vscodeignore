@@ -11,6 +11,7 @@ tsconfig.json
 **/*.map
 **/*.ts
 debug_single_gt.tif
+sample.tif
 *.vsix
 publisher-logo.png
 dist/lib.cjs
