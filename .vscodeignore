@@ -1,0 +1,19 @@
+.vscode/**
+.github/**
+src/**
+test/**
+tools/**
+docs/**
+node_modules/**
+esbuild.js
+tsconfig.json
+.gitignore
+**/*.map
+**/*.ts
+debug_single_gt.tif
+*.vsix
+publisher-logo.png
+dist/lib.cjs
+
+# keep the marketplace icon in the package
+!icon.png

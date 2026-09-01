@@ -1,0 +1,142 @@
+{
+  "name": "tif-sciviewer",
+  "displayName": "TIFF Scientific Viewer",
+  "description": "ImageJ-style preview for scientific TIFF images (float32/16-bit CT, stacks) with display-range contrast control.",
+  "version": "0.1.0",
+  "publisher": "Computational-Imaging",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jiayangshi/tif-sciviewer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jiayangshi/tif-sciviewer/issues"
+  },
+  "homepage": "https://github.com/jiayangshi/tif-sciviewer#readme",
+  "icon": "icon.png",
+  "galleryBanner": {
+    "color": "#181B21",
+    "theme": "dark"
+  },
+  "qna": "marketplace",
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Visualization",
+    "Data Science"
+  ],
+  "keywords": [
+    "tiff",
+    "tif",
+    "imagej",
+    "ct",
+    "microscopy",
+    "float32",
+    "scientific",
+    "image",
+    "viewer"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "tifSciviewer.preview",
+        "displayName": "TIFF Scientific Viewer",
+        "selector": [
+          {
+            "filenamePattern": "*.tif"
+          },
+          {
+            "filenamePattern": "*.tiff"
+          },
+          {
+            "filenamePattern": "*.TIF"
+          },
+          {
+            "filenamePattern": "*.TIFF"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "configuration": {
+      "title": "TIFF Scientific Viewer",
+      "properties": {
+        "tifSciviewer.autoContrastOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Apply ImageJ 'Auto' contrast when an image is first opened."
+        },
+        "tifSciviewer.defaultLut": {
+          "type": "string",
+          "enum": [
+            "Grays",
+            "Inverted Grays",
+            "Fire",
+            "Ice",
+            "Spectrum",
+            "Red",
+            "Green",
+            "Blue"
+          ],
+          "default": "Grays",
+          "description": "Lookup table applied to newly opened images."
+        },
+        "tifSciviewer.recomputeRangePerSlice": {
+          "type": "boolean",
+          "default": false,
+          "description": "Recompute the display range for every slice of a stack instead of keeping it fixed."
+        },
+        "tifSciviewer.saturatedPercent": {
+          "type": "number",
+          "default": 0.35,
+          "description": "Saturated pixel percentage used by 'Enhance Contrast' (ImageJ default 0.35)."
+        },
+        "tifSciviewer.maxDecodedMegabytes": {
+          "type": "number",
+          "default": 512,
+          "description": "Refuse to decode a single page larger than this many megabytes, to avoid exhausting memory on a remote host."
+        },
+        "tifSciviewer.nanColor": {
+          "type": "string",
+          "default": "#ff4040",
+          "description": "Colour used for NaN and Inf pixels."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "tifSciviewer.openWith",
+        "title": "Open with TIFF Scientific Viewer",
+        "category": "TIFF"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "test": "node --test test/*.test.mjs",
+    "fixtures": "npm run sample && python3 test/make_fixtures.py && python3 test/make_contrast_truth.py",
+    "typecheck": "tsc --noEmit",
+    "build:lib": "esbuild src/lib.ts --bundle --outfile=dist/lib.cjs --platform=node --format=cjs --target=node18",
+    "pretest": "npm run build:lib",
+    "package": "npx --yes @vscode/vsce package --no-dependencies -o tif-sciviewer.vsix",
+    "vscode:prepublish": "node esbuild.js",
+    "verify": "npm run typecheck && npm run build && npm test",
+    "publish:vsce": "npx --yes @vscode/vsce publish --no-dependencies",
+    "publish:ovsx": "npx --yes ovsx publish tif-sciviewer.vsix",
+    "sample": "node tools/make-sample-tif.mjs sample.tif",
+    "figure": "node tools/make-readme-figure.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.84.0",
+    "esbuild": "^0.20.0",
+    "jsdom": "^30.0.1",
+    "typescript": "^5.3.0"
+  }
+}

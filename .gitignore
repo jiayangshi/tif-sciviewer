@@ -1,0 +1,18 @@
+# dependencies and build output
+node_modules/
+dist/
+media/viewer.js
+media/viewer.js.map
+*.vsix
+
+# generated test inputs (recreate with `npm run fixtures`)
+test/fixtures/
+sample.tif
+
+# research data stays out of the repository
+debug_single_gt.tif
+
+# OS and tooling noise
+.DS_Store
+__pycache__/
+*.pyc
