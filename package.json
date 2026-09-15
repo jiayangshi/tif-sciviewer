@@ -113,8 +113,28 @@
         "command": "tifSciviewer.openWith",
         "title": "Open with TIFF Scientific Viewer",
         "category": "TIFF"
+      },
+      {
+        "command": "tifSciviewer.openAsStack",
+        "title": "Open as Stack",
+        "category": "TIFF"
       }
-    ]
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "tifSciviewer.openAsStack",
+          "when": "resourceExtname =~ /^\\.tiff?$/i",
+          "group": "navigation@30"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "tifSciviewer.openAsStack",
+          "when": "false"
+        }
+      ]
+    }
   },
   "scripts": {
     "build": "node esbuild.js",
@@ -124,17 +144,19 @@
     "typecheck": "tsc --noEmit",
     "build:lib": "esbuild src/lib.ts --bundle --outfile=dist/lib.cjs --platform=node --format=cjs --target=node18",
     "pretest": "npm run build:lib",
-    "package": "npx --yes @vscode/vsce package --no-dependencies -o tif-sciviewer.vsix",
+    "package": "vsce package --no-dependencies -o tif-sciviewer.vsix",
     "vscode:prepublish": "node esbuild.js",
     "verify": "npm run typecheck && npm run build && npm test",
-    "publish:vsce": "npx --yes @vscode/vsce publish --no-dependencies",
-    "publish:ovsx": "npx --yes ovsx publish tif-sciviewer.vsix",
     "sample": "node tools/make-sample-tif.mjs sample.tif",
-    "figure": "node tools/make-readme-figure.mjs"
+    "figure": "node tools/make-readme-figure.mjs",
+    "sequence": "node tools/make-sequence.mjs",
+    "package:release": "vsce package --no-dependencies",
+    "package:ls": "vsce ls"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.84.0",
+    "@vscode/vsce": "^4.0.0",
     "esbuild": "^0.20.0",
     "jsdom": "^30.0.1",
     "typescript": "^5.3.0"

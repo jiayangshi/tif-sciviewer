@@ -37,6 +37,13 @@ interface InitMessage {
     hyperstack: boolean; savedMin?: number; savedMax?: number; unit?: string;
     shape?: number[]; source: string;
   };
+  /** Present when the stack was assembled from several files. */
+  sequence?: { count: number; labels: string[] };
+  /**
+   * Opening window computed across the stack, not just its first slice - one
+   * per channel. An entry is null where the host could not find one.
+   */
+  stackAuto?: ({ min: number; max: number } | null)[];
   config: {
     autoContrastOnOpen: boolean; defaultLut: string;
     recomputeRangePerSlice: boolean; saturatedPercent: number;
@@ -61,6 +68,18 @@ class Viewer {
   private axisT = 0;
   /** ImageJ keeps a display range per channel; so do we. */
   private channelRanges = new Map<number, Range>();
+
+  /**
+   * What the Min/Max sliders span: the data range of the slice on screen, as
+   * ImageJ's B&C spans defaultMin..defaultMax.
+   *
+   * It follows the slice while the display range itself is held, so stepping
+   * through a stack moves the handles to show where the held range sits in
+   * each slice's data, the same way the histogram's lines move. An axis fixed
+   * for the whole stack was tried and is wrong: the sliders then reach values a
+   * slice does not contain, and cannot reach ones it does.
+   */
+  private scale: Range = { min: 0, max: 1 };
 
   private range: Range = { min: 0, max: 1 };
   private fullRange: Range = { min: 0, max: 1 };
@@ -144,9 +163,19 @@ class Viewer {
         // An ImageJ-written file already carries the range someone chose.
         this.range = { min: saved.savedMin, max: saved.savedMax };
       } else if (this.init?.config.autoContrastOnOpen) {
-        const auto = autoAdjust(this.stats!, 0);
-        this.range = auto.range;
-        this.autoThreshold = auto.autoThreshold;
+        // Opening a stack windows the stack. Auto-contrast from slice 0 alone
+        // would leave every slice at a different level saturated the moment the
+        // range is held - which is the whole point of holding it.
+        // Each channel gets its own, as it keeps its own range.
+        const wholeStack = perSlice ? undefined : this.init.stackAuto?.[channels > 1 ? this.axisC : 0];
+        if (wholeStack) {
+          this.range = { ...wholeStack };
+          this.autoThreshold = 0;
+        } else {
+          const auto = autoAdjust(this.stats!, 0);
+          this.range = auto.range;
+          this.autoThreshold = auto.autoThreshold;
+        }
       } else {
         this.range = { ...this.fullRange };
       }
@@ -157,6 +186,7 @@ class Viewer {
     // else: single-channel stack, keep whatever range the user has set.
 
     if (channels > 1) this.channelRanges.set(this.axisC, this.range);
+    this.scale = { ...this.fullRange };
 
     this.hideError();
     if (!this.userHasZoomed) this.fitToWindow();
@@ -344,7 +374,16 @@ class Viewer {
     if (channels > 1) parts.push(`c ${this.axisC + 1}/${channels}`);
     parts.push(`z ${this.axisZ + 1}/${slices}`);
     if (frames > 1) parts.push(`t ${this.axisT + 1}/${frames}`);
-    $('slice-label').textContent = `${parts.join('   ')}   (page ${this.sliceIndex + 1}/${this.init!.pageCount})`;
+
+    // For a multi-file stack the member's own name says far more than a page number.
+    const seq = this.init!.sequence;
+    const tail = seq
+      ? seq.labels[this.sliceIndex] ?? ''
+      : `(page ${this.sliceIndex + 1}/${this.init!.pageCount})`;
+
+    const el = $('slice-label');
+    el.textContent = `${parts.join('   ')}   ${tail}`;
+    el.title = tail; // long names are clipped in the sidebar
   }
 
   /** Move to the page implied by the current axis positions. */
@@ -436,11 +475,11 @@ class Viewer {
 
   private syncControls() {
     this.syncing = true;
-    const span = this.fullRange.max - this.fullRange.min || 1;
-    const toSlider = (v: number) => Math.round(((v - this.fullRange.min) / span) * 1000);
+    const span = this.scale.max - this.scale.min || 1;
+    const toSlider = (v: number) => Math.round(((v - this.scale.min) / span) * 1000);
     $<HTMLInputElement>('slider-min').value = String(clamp(toSlider(this.range.min), 0, 1000));
     $<HTMLInputElement>('slider-max').value = String(clamp(toSlider(this.range.max), 0, 1000));
-    const bc = toBrightnessContrast(this.fullRange, this.range);
+    const bc = toBrightnessContrast(this.scale, this.range);
     $<HTMLInputElement>('slider-brightness').value = String(Math.round(bc.brightness * 1000));
     $<HTMLInputElement>('slider-contrast').value = String(Math.round(bc.contrast * 1000));
     this.syncNumericFields();
@@ -454,31 +493,46 @@ class Viewer {
    */
   private applyRange(next: Range, resync = true) {
     this.range = next;
-    if (this.init && this.axisSizes().channels > 1) this.channelRanges.set(this.axisC, next);
+    const multiChannel = !!this.init && this.axisSizes().channels > 1;
+    if (multiChannel) this.channelRanges.set(this.axisC, next);
     this.pixelsDirty = true;
     if (resync) this.syncControls();
     this.scheduleDraw();
   }
 
+  /**
+   * ImageJ's ContrastAdjuster.adjustMin/adjustMax. The value is kept inside
+   * the data of the slice on screen, and moving one end pulls the other back
+   * inside it too, so a range set this way never reaches past the data. A
+   * typed range is the one way past it, as with ImageJ's Set.
+   */
+  private adjustMin(v: number) {
+    const min = clamp(v, this.scale.min, this.scale.max);
+    this.applyRange({ min, max: Math.max(min, Math.min(this.range.max, this.scale.max)) });
+  }
+
+  private adjustMax(v: number) {
+    const max = clamp(v, this.scale.min, this.scale.max);
+    this.applyRange({ min: Math.min(max, Math.max(this.range.min, this.scale.min)), max });
+  }
+
   private wireControls() {
     const sliderToValue = (raw: number) =>
-      this.fullRange.min + (raw / 1000) * (this.fullRange.max - this.fullRange.min);
+      this.scale.min + (raw / 1000) * (this.scale.max - this.scale.min);
 
     $('slider-min').addEventListener('input', e => {
       if (this.syncing) return;
-      const v = sliderToValue(Number((e.target as HTMLInputElement).value));
-      this.applyRange({ min: v, max: Math.max(v, this.range.max) });
+      this.adjustMin(sliderToValue(Number((e.target as HTMLInputElement).value)));
     });
     $('slider-max').addEventListener('input', e => {
       if (this.syncing) return;
-      const v = sliderToValue(Number((e.target as HTMLInputElement).value));
-      this.applyRange({ min: Math.min(v, this.range.min), max: v });
+      this.adjustMax(sliderToValue(Number((e.target as HTMLInputElement).value)));
     });
     const bcHandler = () => {
       if (this.syncing) return;
       const b = Number($<HTMLInputElement>('slider-brightness').value) / 1000;
       const c = Number($<HTMLInputElement>('slider-contrast').value) / 1000;
-      this.applyRange(fromBrightnessContrast(this.fullRange, b, c), false);
+      this.applyRange(fromBrightnessContrast(this.scale, b, c), false);
       this.syncNumericFields();
     };
     $('slider-brightness').addEventListener('input', bcHandler);
@@ -689,8 +743,8 @@ class Viewer {
     window.addEventListener('pointermove', e => {
       if (!active || !this.stats) return;
       const v = valueAt(e.clientX);
-      if (active === 'min') this.applyRange({ min: Math.min(v, this.range.max), max: this.range.max });
-      else this.applyRange({ min: this.range.min, max: Math.max(v, this.range.min) });
+      if (active === 'min') this.adjustMin(v);
+      else this.adjustMax(v);
     });
     window.addEventListener('pointerup', () => { active = null; });
   }

@@ -47,13 +47,18 @@ export class TiffEditorProvider implements vscode.CustomReadonlyEditorProvider<T
         case 'ready': {
           const cfg = vscode.workspace.getConfiguration('tifSciviewer');
           try {
+            const seq = document.sequence;
             post({
               type: 'init',
-              fileName: document.uri.path.split('/').pop() ?? 'image.tif',
+              fileName: seq
+                ? `${seq.folder}  (${seq.count} files)`
+                : document.uri.path.split('/').pop() ?? 'image.tif',
               fileSize: document.fileSize,
               pageCount: document.pageCount,
               meta: describeMeta(document),
               stack: document.stack,
+              stackAuto: document.stackWindows(),
+              sequence: seq ? { count: seq.count, labels: seq.labels } : undefined,
               config: {
                 autoContrastOnOpen: cfg.get('autoContrastOnOpen', true),
                 defaultLut: cfg.get('defaultLut', 'Grays'),
@@ -81,7 +86,11 @@ export class TiffEditorProvider implements vscode.CustomReadonlyEditorProvider<T
           void vscode.window.showErrorMessage(`TIFF viewer: ${String(msg.message ?? '')}`);
           break;
         case 'savePng':
-          void savePng(document.uri, String(msg.dataUrl ?? ''), Number(msg.sliceIndex) || 0);
+          // Strip the stack query: the save dialog wants a plain file path.
+          void savePng(
+            document.uri.with({ query: '' }), String(msg.dataUrl ?? ''), Number(msg.sliceIndex) || 0,
+            document.sequence?.labels[Number(msg.sliceIndex) || 0],
+          );
           break;
       }
     });
@@ -105,7 +114,9 @@ export class TiffEditorProvider implements vscode.CustomReadonlyEditorProvider<T
  * The webview sandbox blocks downloads, so the export round-trips through the
  * host, which owns the save dialog and the filesystem.
  */
-async function savePng(sourceUri: vscode.Uri, dataUrl: string, sliceIndex: number): Promise<void> {
+async function savePng(
+  sourceUri: vscode.Uri, dataUrl: string, sliceIndex: number, sliceName?: string,
+): Promise<void> {
   const comma = dataUrl.indexOf(',');
   if (!dataUrl.startsWith('data:image/png;base64,') || comma < 0) {
     void vscode.window.showErrorMessage('TIFF viewer: the rendered image could not be read.');
@@ -113,8 +124,10 @@ async function savePng(sourceUri: vscode.Uri, dataUrl: string, sliceIndex: numbe
   }
   const bytes = Buffer.from(dataUrl.slice(comma + 1), 'base64');
 
-  const base = (sourceUri.path.split('/').pop() ?? 'image.tif').replace(/\.tiff?$/i, '');
-  const suffix = sliceIndex > 0 ? `_z${String(sliceIndex).padStart(4, '0')}` : '';
+  // For a stack the slice's own file name is a better stem than the first member's.
+  const stem = sliceName ?? sourceUri.path.split('/').pop() ?? 'image.tif';
+  const base = stem.replace(/\s*\[\d+\/\d+\]$/, '').replace(/\.tiff?$/i, '');
+  const suffix = sliceIndex > 0 && !sliceName ? `_z${String(sliceIndex).padStart(4, '0')}` : '';
   const target = await vscode.window.showSaveDialog({
     defaultUri: sourceUri.with({ path: sourceUri.path.replace(/[^/]+$/, `${base}${suffix}.png`) }),
     filters: { 'PNG image': ['png'] },

@@ -109,7 +109,7 @@ export interface StackMeta {
   /** Logical array shape as recorded by tifffile, if present. */
   shape?: number[];
   /** Human-readable note about where this came from. */
-  source: 'imagej' | 'tifffile' | 'pages';
+  source: 'imagej' | 'tifffile' | 'pages' | 'sequence';
 }
 
 export function bytesPerSample(dtype: DType): number {

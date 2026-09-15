@@ -5,6 +5,9 @@ media/viewer.js
 media/viewer.js.map
 *.vsix
 
+# demo image sequences written by `npm run sequence` with no target directory
+out/
+
 # generated test inputs (recreate with `npm run fixtures`)
 test/fixtures/
 sample.tif

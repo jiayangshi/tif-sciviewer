@@ -19,6 +19,7 @@ Deliberate omissions and their reasoning are in `ITERATIONS.md` under
 | A9 | PlanarConfiguration chunky (1) and planar (2) | should | done |
 | A10 | SamplesPerPixel 1 (gray), 3 (RGB), 4; a 4th sample stays opaque, never alpha | should | done |
 | A11 | Multi-page files → stack | must | done |
+| A12a | Multi-select → stack (ImageJ Image Sequence) | should | done |
 | A12 | Parse ImageJ `ImageDescription` (images/channels/slices/frames/min/max/unit) | must | done |
 | A13 | Parse `tifffile` JSON `ImageDescription` (`{"shape": [...]}`) | must | done |
 | A14 | Lazy per-page decode; never hold the whole stack in memory at once | must | done |

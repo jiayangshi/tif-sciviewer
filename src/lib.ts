@@ -7,5 +7,6 @@ export * from './imagej/contrast';
 export * from './imagej/luts';
 export * from './imagej/render';
 export * from './wire';
+export * from './sequence';
 export * from './sliceSource';
 export * from './webviewHtml';
