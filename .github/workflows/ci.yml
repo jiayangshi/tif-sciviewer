@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    # Branches only. Naming any tag filter here - even tags-ignore - would make
+    # tag pushes match this workflow as well; version tags belong to release.yml,
+    # which runs the same checks.
+    branches: ['**']
+  pull_request:
+
+# A superseded run tells you nothing useful.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, test and package
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # test/fixtures is deliberately not in git: the fixtures are written by
+      # tifffile, so the decoder is checked against the library that produces
+      # the files it has to read. Without this step `npm test` has no inputs.
+      - name: Generate test fixtures
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy tifffile imagecodecs
+          npm run fixtures
+
+      # typecheck -> esbuild bundle -> node --test
+      - name: Typecheck, build and test
+        run: npm run verify
+
+      - name: Verify the extension packages
+        run: npm run package:release
+
+      - name: Show what would ship
+        run: npm run package:ls
+
+      - name: Upload the .vsix for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsix-${{ github.sha }}
+          path: '*.vsix'
+          if-no-files-found: error
+          retention-days: 14

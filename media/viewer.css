@@ -230,3 +230,13 @@ button:active { transform: translateY(1px); }
   overflow: hidden;
 }
 #zoom-label { opacity: 0.65; }
+
+/* Slice readout: file names in a multi-file stack can be long. */
+#slice-label {
+  margin-top: 6px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

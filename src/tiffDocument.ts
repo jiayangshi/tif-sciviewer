@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import { BufferReader, ByteReader } from './tiff/decoder';
 import { SliceSource, SlicePayload } from './sliceSource';
 import { PageMeta, StackMeta } from './tiff/types';
+import { SequenceSource, sequenceFromQuery, baseName } from './sequence';
 
 /**
  * Positional reads straight off disk. A 200-page float32 stack is several GB;
@@ -36,17 +37,30 @@ export class FileByteReader implements ByteReader {
   close() { try { fs.closeSync(this.fd); } catch { /* already closed */ } }
 }
 
+/** Set when the document is a stack assembled from several files. */
+export interface SequenceInfo {
+  count: number;
+  /** One entry per slice, naming the file it came from. */
+  labels: string[];
+  /** Folder the members share, for the title. */
+  folder: string;
+}
+
 export class TiffDocument implements vscode.CustomDocument {
   private constructor(
     readonly uri: vscode.Uri,
     private source: SliceSource,
     readonly fileSize: number,
+    readonly sequence?: SequenceInfo,
   ) {}
 
   static async create(uri: vscode.Uri): Promise<TiffDocument> {
     const maxMb = vscode.workspace.getConfiguration('tifSciviewer').get('maxDecodedMegabytes', 512);
     const maxBytes = Math.max(1, maxMb) * 1024 * 1024;
     const CACHE_VALUES = 64 * 1024 * 1024;
+
+    const members = sequenceFromQuery(uri.query);
+    if (members) return TiffDocument.createSequence(uri, members, CACHE_VALUES, maxBytes);
 
     if (uri.scheme === 'file') {
       const reader = new FileByteReader(uri.fsPath);
@@ -64,11 +78,45 @@ export class TiffDocument implements vscode.CustomDocument {
     );
   }
 
+  /**
+   * A stack built from a multi-select. Members are read positionally like any
+   * other file, so selecting 500 slices costs 500 header reads, not 500 decodes.
+   */
+  private static createSequence(
+    uri: vscode.Uri, members: string[], cacheValues: number, maxBytes: number,
+  ): TiffDocument {
+    const uris = members.map(m => vscode.Uri.parse(m, true));
+    const remote = uris.find(u => u.scheme !== 'file');
+    if (remote) {
+      throw new Error(
+        `A stack can only be built from files on disk, but ${baseName(remote.toString())} is `
+        + `"${remote.scheme}:". Open these one at a time instead.`,
+      );
+    }
+
+    const seq = new SequenceSource(members, id => new FileByteReader(vscode.Uri.parse(id, true).fsPath));
+    try {
+      const source = new SliceSource(seq, cacheValues, maxBytes);
+      const folder = baseName(uris[0].path.replace(/\/[^/]*$/, '')) || 'stack';
+      return new TiffDocument(uri, source, seq.totalBytes, {
+        count: seq.entries.length,
+        labels: seq.sliceLabels(),
+        folder,
+      });
+    } catch (e) {
+      seq.close();
+      throw e;
+    }
+  }
+
   get meta(): PageMeta { return this.source.meta; }
   get stack(): StackMeta { return this.source.stack; }
   get pageCount(): number { return this.source.pageCount; }
 
   slicePayload(index: number): SlicePayload { return this.source.payload(index); }
+
+  /** Per channel, a display window representative of the whole stack; undefined for one page. */
+  stackWindows() { return this.source.stackWindows(); }
 
   dispose(): void { this.source.dispose(); }
 }

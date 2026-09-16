@@ -5,9 +5,16 @@
 import { TiffFile, ByteReader } from './tiff/decoder';
 import { PageMeta, StackMeta, NumericArray } from './tiff/types';
 import { computeStats, Stats } from './imagej/stats';
+import { autoAdjust, Range } from './imagej/contrast';
 import { SlicePayload, SerializableStats, toBase64, isLittleEndianHost } from './wire';
+import { PageProvider } from './sequence';
 
 export type { SlicePayload, SerializableStats } from './wire';
+
+/** A reader yields bytes; a provider already knows how to page. */
+function isPageProvider(source: ByteReader | PageProvider): source is PageProvider {
+  return typeof (source as PageProvider).decode === 'function';
+}
 
 export function serializeStats(s: Stats): SerializableStats {
   return {
@@ -25,25 +32,36 @@ export interface CachedSlice {
 }
 
 export class SliceSource {
-  private tiff: TiffFile;
+  private pages: PageProvider;
+  /** Only set when this instance opened the reader and so has to close it. */
+  private ownedReader?: ByteReader;
   readonly meta: PageMeta;
   readonly stack: StackMeta;
 
   /** Insertion-ordered LRU, bounded by total pixels rather than page count. */
   private cache = new Map<number, CachedSlice>();
 
+  /**
+   * Takes either a reader over one TIFF, or a provider that has already
+   * arranged pages some other way - a multi-file sequence, say.
+   */
   constructor(
-    private reader: ByteReader,
+    source: ByteReader | PageProvider,
     private maxCachedValues = 64 * 1024 * 1024,
     private maxDecodedBytes = 512 * 1024 * 1024,
   ) {
-    this.tiff = new TiffFile(reader);
-    this.meta = this.tiff.meta(0);
-    this.stack = this.tiff.stackMeta();
+    if (isPageProvider(source)) {
+      this.pages = source;
+    } else {
+      this.ownedReader = source;
+      this.pages = new TiffFile(source);
+    }
+    this.meta = this.pages.meta(0);
+    this.stack = this.pages.stackMeta();
   }
 
-  get pageCount(): number { return this.tiff.pageCount; }
-  pageMeta(index: number): PageMeta { return this.tiff.meta(index); }
+  get pageCount(): number { return this.pages.pageCount; }
+  pageMeta(index: number): PageMeta { return this.pages.meta(index); }
 
   getSlice(index: number): CachedSlice {
     const hit = this.cache.get(index);
@@ -52,9 +70,9 @@ export class SliceSource {
       this.cache.set(index, hit); // refresh LRU position
       return hit;
     }
-    const meta = this.tiff.meta(index);
+    const meta = this.pages.meta(index);
     this.checkSize(meta);
-    const page = this.tiff.decode(index);
+    const page = this.pages.decode(index);
     const stats = computeStats(page.data, page.dtype, page.samplesPerPixel);
     const entry: CachedSlice = { data: page.data, stats, meta };
     this.cache.set(index, entry);
@@ -91,6 +109,64 @@ export class SliceSource {
 
   get cachedPages(): number[] { return [...this.cache.keys()]; }
 
+  /**
+   * A display window that suits the whole stack rather than just its first
+   * slice, one per channel.
+   *
+   * Auto-contrast from slice 0 alone falls apart the moment a stack's slices
+   * sit at different levels: hold that window and every later slice saturates
+   * to flat white. Sampling across the stack and taking the union of the
+   * per-slice windows gives one range that shows all of it, which is what makes
+   * holding the range across slices useful instead of merely consistent.
+   *
+   * Channels are sampled apart because they are windowed apart: a 0..100
+   * channel given a union taken with a 0..5000 one comes out nearly black.
+   *
+   * Sampling is bounded by pixels rather than page count, so a stack of large
+   * slices reads fewer of them, and a slice that will not decode is skipped
+   * rather than allowed to stop the file opening.
+   */
+  stackWindows(maxSamples = 8, valueBudget = 64 * 1024 * 1024): (Range | undefined)[] | undefined {
+    if (this.pageCount <= 1) return undefined;
+
+    // ImageJ's page order puts channels fastest, so channel c is every
+    // channels-th page starting at c.
+    const channels = Math.min(Math.max(1, this.stack.channels || 1), this.pageCount);
+    const perSlice = Math.max(1, this.meta.width * this.meta.height * this.meta.samplesPerPixel);
+    const affordable = Math.floor(Math.min(maxSamples, valueBudget / perSlice) / channels);
+
+    const windows: (Range | undefined)[] = [];
+    for (let c = 0; c < channels; c++) {
+      const count = Math.ceil((this.pageCount - c) / channels);
+      const samples = Math.min(count, Math.max(2, affordable));
+
+      let min = Infinity;
+      let max = -Infinity;
+      let seen = 0;
+      // Counted down so the channel's own first slice is sampled last: it is the
+      // one about to be shown, and on a stack of pages too large for the cache to
+      // hold two, whatever is sampled after it would evict it and force a second
+      // decode.
+      for (let k = samples - 1; k >= 0; k--) {
+        // Evenly spaced, always including the channel's first and last slice.
+        const nth = samples === 1 ? 0 : Math.round((k * (count - 1)) / (samples - 1));
+        try {
+          const { range } = autoAdjust(this.getSlice(c + nth * channels).stats, 0);
+          if (!Number.isFinite(range.min) || !Number.isFinite(range.max)) continue;
+          min = Math.min(min, range.min);
+          max = Math.max(max, range.max);
+          seen++;
+        } catch {
+          // A page that will not decode should not stop the stack from opening.
+        }
+      }
+
+      const usable = seen > 0 && Number.isFinite(min) && Number.isFinite(max) && max > min;
+      windows.push(usable ? { min, max } : undefined);
+    }
+    return windows.some(w => w) ? windows : undefined;
+  }
+
   payload(index: number): SlicePayload {
     const { data, stats, meta } = this.getSlice(index);
     const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
@@ -109,6 +185,7 @@ export class SliceSource {
 
   dispose() {
     this.cache.clear();
-    this.reader.close?.();
+    this.ownedReader?.close?.();
+    this.pages.close?.();
   }
 }

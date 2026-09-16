@@ -14,6 +14,22 @@
       "problemMatcher": "$tsc-watch",
       "isBackground": true,
       "label": "npm: watch"
+    },
+    {
+      "label": "make sequence sample",
+      "type": "shell",
+      "command": "node tools/make-sequence.mjs test/fixtures/recon 24",
+      "problemMatcher": [],
+      "detail": "24 single-slice TIFFs for trying Open as Stack"
+    },
+    {
+      "label": "build + sequence",
+      "dependsOn": [
+        "npm: build",
+        "make sequence sample"
+      ],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
     }
   ]
 }
