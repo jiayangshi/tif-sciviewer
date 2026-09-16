@@ -46,6 +46,8 @@ export class TiffEditorProvider implements vscode.CustomReadonlyEditorProvider<T
       switch (msg.type) {
         case 'ready': {
           const cfg = vscode.workspace.getConfiguration('tifSciviewer');
+          const autoContrastOnOpen = cfg.get('autoContrastOnOpen', true);
+          const recomputeRangePerSlice = cfg.get('recomputeRangePerSlice', false);
           try {
             const seq = document.sequence;
             post({
@@ -57,12 +59,16 @@ export class TiffEditorProvider implements vscode.CustomReadonlyEditorProvider<T
               pageCount: document.pageCount,
               meta: describeMeta(document),
               stack: document.stack,
-              stackAuto: document.stackWindows(),
+              // Sampling decodes pages, so it is skipped when the viewer would
+              // throw the result away: either mode below windows each slice itself.
+              stackAuto: autoContrastOnOpen && !recomputeRangePerSlice
+                ? document.stackWindows()
+                : undefined,
               sequence: seq ? { count: seq.count, labels: seq.labels } : undefined,
               config: {
-                autoContrastOnOpen: cfg.get('autoContrastOnOpen', true),
+                autoContrastOnOpen,
                 defaultLut: cfg.get('defaultLut', 'Grays'),
-                recomputeRangePerSlice: cfg.get('recomputeRangePerSlice', false),
+                recomputeRangePerSlice,
                 saturatedPercent: cfg.get('saturatedPercent', 0.35),
               },
             });
@@ -89,7 +95,7 @@ export class TiffEditorProvider implements vscode.CustomReadonlyEditorProvider<T
           // Strip the stack query: the save dialog wants a plain file path.
           void savePng(
             document.uri.with({ query: '' }), String(msg.dataUrl ?? ''), Number(msg.sliceIndex) || 0,
-            document.sequence?.labels[Number(msg.sliceIndex) || 0],
+            document.sequence?.labels,
           );
           break;
       }
@@ -115,7 +121,7 @@ export class TiffEditorProvider implements vscode.CustomReadonlyEditorProvider<T
  * host, which owns the save dialog and the filesystem.
  */
 async function savePng(
-  sourceUri: vscode.Uri, dataUrl: string, sliceIndex: number, sliceName?: string,
+  sourceUri: vscode.Uri, dataUrl: string, sliceIndex: number, sliceLabels?: string[],
 ): Promise<void> {
   const comma = dataUrl.indexOf(',');
   if (!dataUrl.startsWith('data:image/png;base64,') || comma < 0) {
@@ -124,10 +130,16 @@ async function savePng(
   }
   const bytes = Buffer.from(dataUrl.slice(comma + 1), 'base64');
 
-  // For a stack the slice's own file name is a better stem than the first member's.
-  const stem = sliceName ?? sourceUri.path.split('/').pop() ?? 'image.tif';
-  const base = stem.replace(/\s*\[\d+\/\d+\]$/, '').replace(/\.tiff?$/i, '');
-  const suffix = sliceIndex > 0 && !sliceName ? `_z${String(sliceIndex).padStart(4, '0')}` : '';
+  // For a stack the slice's own file name is a better stem than the first member's,
+  // but only when it picks out one slice: a selection can hold two files of the
+  // same name from different folders, and a member that is itself multi-page
+  // gives every one of its pages the same name. Otherwise the dialog would
+  // offer one path for several slices and quietly overwrite the earlier save.
+  const stem = (i: number) => sliceLabels?.[i] ?? sourceUri.path.split('/').pop() ?? 'image.tif';
+  const shorten = (s: string) => s.replace(/\s*\[\d+\/\d+\]$/, '').replace(/\.tiff?$/i, '');
+  const base = shorten(stem(sliceIndex));
+  const named = sliceLabels ? sliceLabels.filter(l => shorten(l) === base).length === 1 : false;
+  const suffix = sliceIndex > 0 && !named ? `_z${String(sliceIndex).padStart(4, '0')}` : '';
   const target = await vscode.window.showSaveDialog({
     defaultUri: sourceUri.with({ path: sourceUri.path.replace(/[^/]+$/, `${base}${suffix}.png`) }),
     filters: { 'PNG image': ['png'] },

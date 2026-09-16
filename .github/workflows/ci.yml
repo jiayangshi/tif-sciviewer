@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
+    # Branches only. Naming any tag filter here - even tags-ignore - would make
+    # tag pushes match this workflow as well; version tags belong to release.yml,
+    # which runs the same checks.
     branches: ['**']
-    # Version tags are handled by release.yml, which runs the same checks.
-    tags-ignore: ['v*']
   pull_request:
 
 # A superseded run tells you nothing useful.

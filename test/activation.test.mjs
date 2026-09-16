@@ -6,7 +6,9 @@ import Module from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import os from 'node:os';
-import { writeSequence, expectedValue } from '../tools/make-sequence.mjs';
+import { writeSequence, writeSliceTif, expectedValue } from '../tools/make-sequence.mjs';
+import { phantomSlice } from '../tools/phantom.mjs';
+import { spawnSync } from 'node:child_process';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
@@ -25,8 +27,8 @@ function makeUri({ scheme = 'file', path = '', query = '' }) {
   };
 }
 
-function loadExtension() {
-  const calls = { registered: [], commands: [], disposables: [], handlers: {}, executed: [] };
+function loadExtension(settings = {}) {
+  const calls = { registered: [], commands: [], disposables: [], handlers: {}, executed: [], saveDialogs: [] };
   const stub = {
     Uri: {
       joinPath: (base, ...parts) => makeUri({ scheme: base.scheme, path: [base.path, ...parts].join('/') }),
@@ -46,7 +48,7 @@ function loadExtension() {
       showInformationMessage: m => calls.commands.push(['info', m]),
       showWarningMessage: m => calls.commands.push(['warn', m]),
       setStatusBarMessage: () => ({ dispose() {} }),
-      showSaveDialog: async () => undefined,
+      showSaveDialog: async (opts) => { calls.saveDialogs.push(opts); return undefined; },
       activeTextEditor: undefined,
     },
     commands: {
@@ -58,7 +60,7 @@ function loadExtension() {
       executeCommand: async (...args) => { calls.executed.push(args); },
     },
     workspace: {
-      getConfiguration: () => ({ get: (_k, d) => d }),
+      getConfiguration: () => ({ get: (k, d) => (k in settings ? settings[k] : d) }),
       fs: { readFile: async () => new Uint8Array(0), writeFile: async () => {} },
     },
     env: { clipboard: { writeText: async () => {} } },
@@ -310,8 +312,8 @@ describe('a stack document, end to end through the extension host', () => {
   after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
   /** Drive the real command, then open whatever URI it produced. */
-  async function openStack(files = paths) {
-    const loaded = loadExtension();
+  async function openStack(files = paths, settings = {}) {
+    const loaded = loadExtension(settings);
     loaded.ext.activate({ subscriptions: [], extensionUri: { scheme: 'file', path: ROOT } });
     const picked = files.map(p => makeUri({ path: p }));
     await loaded.calls.handlers['tifSciviewer.openAsStack'](picked[0], picked);
@@ -347,6 +349,84 @@ describe('a stack document, end to end through the extension host', () => {
       assert.equal(values[probe], expectedValue(W, H, probe, n, COUNT), `slice ${n}`);
     }
     doc.dispose();
+  });
+
+  // Two files can share a name: a selection may span folders, and a member that
+  // is itself multi-page gives all of its pages the same one. Saving a PNG of
+  // each must not offer the same path twice and overwrite the first.
+  test('slices that share a name get distinct PNG names', async () => {
+    const twins = ['one', 'two'].map(sub =>
+      writeSliceTif(path.join(dir, sub, 'img.tif'),
+        { width: W, height: H, pixels: phantomSlice(W, H, 0.5) }));
+    const { provider, uri, calls } = await openStack(twins);
+    const doc = await provider.openCustomDocument(uri);
+    const panel = fakePanel();
+    await provider.resolveCustomEditor(doc, panel, {});
+    panel.send({ type: 'ready' });
+
+    for (const index of [0, 1]) {
+      panel.send({ type: 'savePng', dataUrl: 'data:image/png;base64,aGk=', sliceIndex: index });
+    }
+    await new Promise(r => setImmediate(r));
+    const offered = calls.saveDialogs.map(o => o.defaultUri.path);
+    assert.equal(offered.length, 2);
+    assert.notEqual(offered[0], offered[1], `both slices offered ${offered[0]}`);
+    assert.match(offered[1], /img_z0001\.png$/);
+    doc.dispose();
+  });
+
+  test('a name that picks out one slice is kept as it is', async () => {
+    const { provider, uri, calls } = await openStack();
+    const doc = await provider.openCustomDocument(uri);
+    const panel = fakePanel();
+    await provider.resolveCustomEditor(doc, panel, {});
+    panel.send({ type: 'ready' });
+    panel.send({ type: 'savePng', dataUrl: 'data:image/png;base64,aGk=', sliceIndex: 3 });
+    await new Promise(r => setImmediate(r));
+    assert.match(calls.saveDialogs[0].defaultUri.path, /slice_0004\.png$/);
+    doc.dispose();
+  });
+
+  // Sampling decodes pages, so it should not run for settings that discard it.
+  test('the stack is only sampled when the viewer will use the result', async () => {
+    const initFor = async (settings) => {
+      const { provider, uri } = await openStack(paths, settings);
+      const doc = await provider.openCustomDocument(uri);
+      const panel = fakePanel();
+      await provider.resolveCustomEditor(doc, panel, {});
+      panel.send({ type: 'ready' });
+      const init = panel.posted.find(m => m.type === 'init');
+      doc.dispose();
+      return init;
+    };
+    assert.ok((await initFor({})).stackAuto, 'by default the stack is windowed as a whole');
+    assert.equal((await initFor({ recomputeRangePerSlice: true })).stackAuto, undefined,
+      'each slice windows itself, so the survey would be thrown away');
+    assert.equal((await initFor({ autoContrastOnOpen: false })).stackAuto, undefined,
+      'nothing is auto-windowed on open, so the survey would be thrown away');
+  });
+
+  // Its guard compares import.meta.url against argv[1]: a space percent-encodes
+  // in the first and not the second, and macOS temp directories are symlinks,
+  // which Node resolves in the first and not the second. Either mismatch used
+  // to make the CLI exit 0 having written nothing - as the VS Code task and the
+  // "Open as Stack" launch config would, on a workspace path with a space.
+  test('the generator CLI runs from a path with a space or a symlink in it', () => {
+    const where = fs.mkdtempSync(path.join(os.tmpdir(), 'tif cli-'));
+    try {
+      fs.mkdirSync(path.join(where, 'tools'));
+      for (const f of ['make-sequence.mjs', 'phantom.mjs']) {
+        fs.copyFileSync(path.join(ROOT, 'tools', f), path.join(where, 'tools', f));
+      }
+      const out = path.join(where, 'out');
+      const run = spawnSync(process.execPath, [path.join(where, 'tools', 'make-sequence.mjs'), out, '2'],
+        { encoding: 'utf8' });
+      assert.equal(run.status, 0, run.stderr);
+      assert.equal(fs.existsSync(out) ? fs.readdirSync(out).length : 0, 2,
+        `wrote nothing; stdout was ${JSON.stringify(run.stdout)}`);
+    } finally {
+      fs.rmSync(where, { recursive: true, force: true });
+    }
   });
 
   test('the viewer is told it is looking at a sequence', async () => {

@@ -12,6 +12,9 @@ import { TiffFile, ByteReader } from './tiff/decoder';
 import { PageMeta, DecodedPage, StackMeta } from './tiff/types';
 
 /** The page-level surface `SliceSource` needs; `TiffFile` already satisfies it. */
+/** Already names both files, so it is rethrown as it is. */
+class ShapeMismatch extends Error {}
+
 export interface PageProvider {
   readonly pageCount: number;
   meta(page: number): PageMeta;
@@ -183,7 +186,7 @@ export class SequenceSource implements PageProvider {
           here.width !== shape.width || here.height !== shape.height
           || here.spp !== shape.spp || here.dtype !== shape.dtype
         ) {
-          throw new Error(
+          throw new ShapeMismatch(
             `${name} is ${describeShape(here)} but ${shapeFrom} is ${describeShape(shape)}. `
             + 'Every file in a stack has to have the same shape and pixel type.',
           );
@@ -192,7 +195,8 @@ export class SequenceSource implements PageProvider {
         start += tiff.pageCount;
         bytes += reader.size;
       } catch (e) {
-        throw new Error(`${name}: ${message(e)}`);
+        // Anything else went wrong while reading this file, so name it.
+        throw e instanceof ShapeMismatch ? e : new Error(`${name}: ${message(e)}`);
       } finally {
         reader.close?.();
       }

@@ -11,6 +11,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { phantomSlice } from './phantom.mjs';
 
 const DTYPES = {
@@ -109,7 +110,13 @@ export function expectedValue(width, height, index, n, count) {
   return sliceValues(width, height, n, count)[index];
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Compare like with like. A template of `file://${process.argv[1]}` skipped this
+// whole block whenever the path held a space or any non-ASCII character, which
+// percent-encode in import.meta.url; realpath because Node resolves symlinks
+// there and not in argv (every macOS temp directory is one).
+const invokedDirectly = process.argv[1]
+  && pathToFileURL(fs.realpathSync(process.argv[1])).href === import.meta.url;
+if (invokedDirectly) {
   const dir = process.argv[2] ?? 'out/sequence';
   const count = Number(process.argv[3] ?? 24);
   const written = writeSequence(dir, { count, width: 256, height: 256 });

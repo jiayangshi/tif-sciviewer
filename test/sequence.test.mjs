@@ -197,7 +197,8 @@ describe('SequenceSource', () => {
     });
     assert.throws(
       () => new SequenceSource([...paths, odd], plainFactory),
-      (e) => /wrong_size\.tif/.test(e.message) && /same shape/.test(e.message),
+      (e) => /same shape/.test(e.message)
+        && e.message.match(/wrong_size\.tif/g).length === 1,   // not "name: name is ..." 
     );
   });
 
@@ -207,7 +208,8 @@ describe('SequenceSource', () => {
     });
     assert.throws(
       () => new SequenceSource([...paths, u16], plainFactory),
-      (e) => /wrong_dtype\.tif/.test(e.message) && /same shape/.test(e.message),
+      (e) => /same shape/.test(e.message)
+        && e.message.match(/wrong_dtype\.tif/g).length === 1,
     );
   });
 
@@ -403,6 +405,44 @@ describe('a display window for the whole stack', () => {
     } finally {
       fs.rmSync(where, { recursive: true, force: true });
     }
+  });
+});
+
+describe('sampling a stack for its window', () => {
+  /** A stand-in stack that counts how often a page is decoded. */
+  function countingPages({ pages = 6, width = 32, height = 32 } = {}) {
+    let decodes = 0;
+    const meta = i => ({
+      index: i, width, height, samplesPerPixel: 1, dtype: 'float32',
+      bitsPerSample: [32], compression: 1, compressionName: 'none',
+      photometric: 1, planarConfig: 1,
+    });
+    return {
+      pageCount: pages,
+      meta,
+      stackMeta: () => ({ pages, channels: 1, slices: pages, frames: 1, hyperstack: false, source: 'pages' }),
+      decode(i) {
+        decodes++;
+        const data = new Float32Array(width * height);
+        for (let k = 0; k < data.length; k++) data[k] = i + k / data.length;
+        return { ...meta(i), data };
+      },
+      get decodes() { return decodes; },
+    };
+  }
+
+  // On pages too large for the cache to hold two, sampling used to end on some
+  // other slice and evict page 0 - the one the viewer is about to be sent.
+  test('it leaves the slice about to be shown in the cache', () => {
+    const pages = countingPages({ pages: 6 });
+    const source = new SliceSource(pages, 2 * 32 * 32);   // room for two pages
+    source.stackWindows();
+    const sampled = pages.decodes;
+    assert.ok(sampled > 1, 'the survey should decode more than one page (premise)');
+
+    source.payload(0);
+    assert.equal(pages.decodes, sampled, 'the first slice should not be decoded a second time');
+    source.dispose();
   });
 });
 

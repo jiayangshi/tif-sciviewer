@@ -143,7 +143,11 @@ export class SliceSource {
       let min = Infinity;
       let max = -Infinity;
       let seen = 0;
-      for (let k = 0; k < samples; k++) {
+      // Counted down so the channel's own first slice is sampled last: it is the
+      // one about to be shown, and on a stack of pages too large for the cache to
+      // hold two, whatever is sampled after it would evict it and force a second
+      // decode.
+      for (let k = samples - 1; k >= 0; k--) {
         // Evenly spaced, always including the channel's first and last slice.
         const nth = samples === 1 ? 0 : Math.round((k * (count - 1)) / (samples - 1));
         try {

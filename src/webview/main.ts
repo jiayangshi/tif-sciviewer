@@ -69,9 +69,10 @@ class Viewer {
   /** ImageJ keeps a display range per channel; so do we. */
   private channelRanges = new Map<number, Range>();
 
+  private range: Range = { min: 0, max: 1 };
   /**
-   * What the Min/Max sliders span: the data range of the slice on screen, as
-   * ImageJ's B&C spans defaultMin..defaultMax.
+   * The data range of the slice on screen, which is what the Min/Max sliders
+   * span, as ImageJ's B&C spans defaultMin..defaultMax.
    *
    * It follows the slice while the display range itself is held, so stepping
    * through a stack moves the handles to show where the held range sits in
@@ -79,9 +80,6 @@ class Viewer {
    * for the whole stack was tried and is wrong: the sliders then reach values a
    * slice does not contain, and cannot reach ones it does.
    */
-  private scale: Range = { min: 0, max: 1 };
-
-  private range: Range = { min: 0, max: 1 };
   private fullRange: Range = { min: 0, max: 1 };
   private autoThreshold = 0;
   private lutName = 'Grays';
@@ -186,7 +184,6 @@ class Viewer {
     // else: single-channel stack, keep whatever range the user has set.
 
     if (channels > 1) this.channelRanges.set(this.axisC, this.range);
-    this.scale = { ...this.fullRange };
 
     this.hideError();
     if (!this.userHasZoomed) this.fitToWindow();
@@ -475,11 +472,11 @@ class Viewer {
 
   private syncControls() {
     this.syncing = true;
-    const span = this.scale.max - this.scale.min || 1;
-    const toSlider = (v: number) => Math.round(((v - this.scale.min) / span) * 1000);
+    const span = this.fullRange.max - this.fullRange.min || 1;
+    const toSlider = (v: number) => Math.round(((v - this.fullRange.min) / span) * 1000);
     $<HTMLInputElement>('slider-min').value = String(clamp(toSlider(this.range.min), 0, 1000));
     $<HTMLInputElement>('slider-max').value = String(clamp(toSlider(this.range.max), 0, 1000));
-    const bc = toBrightnessContrast(this.scale, this.range);
+    const bc = toBrightnessContrast(this.fullRange, this.range);
     $<HTMLInputElement>('slider-brightness').value = String(Math.round(bc.brightness * 1000));
     $<HTMLInputElement>('slider-contrast').value = String(Math.round(bc.contrast * 1000));
     this.syncNumericFields();
@@ -507,18 +504,18 @@ class Viewer {
    * typed range is the one way past it, as with ImageJ's Set.
    */
   private adjustMin(v: number) {
-    const min = clamp(v, this.scale.min, this.scale.max);
-    this.applyRange({ min, max: Math.max(min, Math.min(this.range.max, this.scale.max)) });
+    const min = clamp(v, this.fullRange.min, this.fullRange.max);
+    this.applyRange({ min, max: Math.max(min, Math.min(this.range.max, this.fullRange.max)) });
   }
 
   private adjustMax(v: number) {
-    const max = clamp(v, this.scale.min, this.scale.max);
-    this.applyRange({ min: Math.min(max, Math.max(this.range.min, this.scale.min)), max });
+    const max = clamp(v, this.fullRange.min, this.fullRange.max);
+    this.applyRange({ min: Math.min(max, Math.max(this.range.min, this.fullRange.min)), max });
   }
 
   private wireControls() {
     const sliderToValue = (raw: number) =>
-      this.scale.min + (raw / 1000) * (this.scale.max - this.scale.min);
+      this.fullRange.min + (raw / 1000) * (this.fullRange.max - this.fullRange.min);
 
     $('slider-min').addEventListener('input', e => {
       if (this.syncing) return;
@@ -532,7 +529,7 @@ class Viewer {
       if (this.syncing) return;
       const b = Number($<HTMLInputElement>('slider-brightness').value) / 1000;
       const c = Number($<HTMLInputElement>('slider-contrast').value) / 1000;
-      this.applyRange(fromBrightnessContrast(this.scale, b, c), false);
+      this.applyRange(fromBrightnessContrast(this.fullRange, b, c), false);
       this.syncNumericFields();
     };
     $('slider-brightness').addEventListener('input', bcHandler);
