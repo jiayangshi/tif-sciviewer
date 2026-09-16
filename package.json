@@ -2,7 +2,7 @@
   "name": "tif-sciviewer",
   "displayName": "TIFF Scientific Viewer",
   "description": "ImageJ-style preview for scientific TIFF images (float32/16-bit CT, stacks) with display-range contrast control.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "Computational-Imaging",
   "license": "MIT",
   "repository": {
