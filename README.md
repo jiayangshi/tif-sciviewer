@@ -145,7 +145,7 @@ Pages are decoded on demand, so the file never has to fit in memory.
 npm ci                # install exactly what package-lock.json pins
 npm run typecheck
 npm run build         # esbuild: extension, webview and the test barrel
-npm test              # 251 tests
+npm test              # 333 tests
 npm run verify        # all three, in the order CI runs them
 ```
 
@@ -194,13 +194,28 @@ Both install Python and regenerate `test/fixtures`, because those are written by
 
 ### Cutting a release
 
-1. Describe the version in `CHANGELOG.md` and commit.
-2. Bump `package.json` and tag in one step, then push:
+The version is the `"version"` field of `package.json`. The `.vsix` file name,
+the tag and what the Marketplace sees all come from it, never from
+`CHANGELOG.md`. Leave the field alone and let `npm version` change it.
+
+1. Describe the new version in `CHANGELOG.md`, under a heading such as
+   `## [0.1.2] - 2026-09-27`.
+2. Commit, bump, check, and push:
 
    ```bash
-   npm version patch          # or minor / major -> commits and creates vX.Y.Z
-   git push --follow-tags
+   git add -A                 # test/samples/ and *.vsix are ignored, so they stay out
+   git commit -m "Describe the change"
+   npm version patch          # or minor / major: X.Y.Z in package.json and the
+                              # lockfile, commits "X.Y.Z", tags vX.Y.Z
+   npm run package:release    # optional: tif-sciviewer-X.Y.Z.vsix, to try first
+   git push --follow-tags     # the tag starts the Release workflow
    ```
+
+   `npm version` refuses to run with uncommitted changes ("Git working
+   directory not clean"), so commit first. If `"version"` has already been
+   edited by hand, put it back with `git checkout -- package.json` before
+   committing: otherwise `npm version patch` bumps a second time (0.1.2 becomes
+   0.1.3), and `package-lock.json` is left on the old number.
 
 3. When the *Release* workflow finishes, download `tif-sciviewer-<version>.vsix`
    from the GitHub Release, or from the run's artifacts (which come zipped).
@@ -221,7 +236,7 @@ one-time Marketplace setup and the details.
 
 ```bash
 npm run package          # tif-sciviewer.vsix        - stable name, for installing
-npm run package:release  # tif-sciviewer-0.1.0.vsix  - what the release attaches
+npm run package:release  # tif-sciviewer-X.Y.Z.vsix  - what the release attaches
 npm run package:ls       # exactly which files would ship
 ```
 
