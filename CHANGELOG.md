@@ -4,7 +4,9 @@ All notable changes to this extension are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [semantic versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.3] - 2026-09-27
+
+Fixes found reviewing 0.1.2.
 
 ### Fixed
 
