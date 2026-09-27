@@ -224,6 +224,15 @@ function lzwDecodeByChains(input, expectedLength) {
   return out;
 }
 
+describe('predictors on damaged data', () => {
+  test('predictor 2 refuses a 16-bit strip shorter than its rows, rather than zero-filling it', () => {
+    // What a truncated Deflate strip decompresses to: fewer bytes than it should be.
+    const short = new Uint8Array(4 * 3 * 2 - 6);
+    assert.throws(() => lib.undoHorizontalPredictor(short, 4, 3, 1, 16, true), /shorter/);
+    assert.throws(() => lib.undoHorizontalPredictor(new Uint8Array(4 * 3 * 4 - 4), 4, 3, 1, 32, true), /shorter/);
+  });
+});
+
 describe('LZW', () => {
   let seed = 7;
   const rand = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;

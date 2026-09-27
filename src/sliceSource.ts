@@ -8,6 +8,7 @@ import { computeStats, Stats } from './imagej/stats';
 import { autoAdjust, Range } from './imagej/contrast';
 import {
   SlicePayload, SerializableStats, PixelEncoding, Region, toBase64, isLittleEndianHost, sampledSize, clipRegion,
+  PREVIEW_MIN_BYTES,
 } from './wire';
 import { PageProvider } from './sequence';
 
@@ -51,6 +52,8 @@ export class SliceSource {
     source: ByteReader | PageProvider,
     private maxCachedValues = 64 * 1024 * 1024,
     private maxDecodedBytes = 512 * 1024 * 1024,
+    /** Pages smaller than this are sent whole, whatever the viewer asks for. */
+    private minPreviewBytes = PREVIEW_MIN_BYTES,
   ) {
     if (isPageProvider(source)) {
       this.pages = source;
@@ -113,12 +116,21 @@ export class SliceSource {
 
   /**
    * Decode a page before it is asked for, so stepping through a stack finds
-   * the next slice ready. Leaves the eviction order of cached pages alone, and
-   * leaves any failure for the real request to report. True if it decoded.
+   * the next slice ready. Leaves any failure for the real request to report.
+   * True if it decoded.
+   *
+   * Never at the cost of the page most recently served, which is the one on
+   * screen: the viewer is about to ask for all of it in place of its preview.
+   * Where the two do not fit in the cache together - one slice over half the
+   * budget - reading ahead would only have that page decoded twice.
    */
   prefetch(index: number): boolean {
     if (!Number.isInteger(index) || index < 0 || index >= this.pageCount || this.cache.has(index)) return false;
     try {
+      const m = this.pages.meta(index);
+      let shown: CachedSlice | undefined;
+      for (const v of this.cache.values()) shown = v;
+      if (shown && shown.data.length + m.width * m.height * m.samplesPerPixel > this.maxCachedValues) return false;
       this.getSlice(index);
       return true;
     } catch {
@@ -192,8 +204,12 @@ export class SliceSource {
    */
   payload(index: number, encoding: PixelEncoding = 'binary', step = 1, region?: unknown): SlicePayload {
     const { data, stats, meta } = this.getSlice(index);
-    const k = Math.max(1, Math.floor(step) || 1);
-    const r = clipRegion(region, meta.width, meta.height);
+    // The viewer chooses a preview from the page on screen, and the pages of
+    // one file can differ in size - a thumbnail among full slices, say. A page
+    // this small gains nothing from a preview, so it goes whole.
+    const whole = data.byteLength < this.minPreviewBytes;
+    const k = whole ? 1 : Math.max(1, Math.floor(step) || 1);
+    const r = whole ? undefined : clipRegion(region, meta.width, meta.height);
     const sent = k > 1 || r ? subsample(data, meta.width, meta.height, meta.samplesPerPixel, k, r) : data;
     const bytes = new Uint8Array(sent.buffer, sent.byteOffset, sent.byteLength);
     return {

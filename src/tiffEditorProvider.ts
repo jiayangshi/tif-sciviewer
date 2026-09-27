@@ -90,8 +90,9 @@ export class TiffEditorProvider implements vscode.CustomReadonlyEditorProvider<T
           );
           break;
         case 'prefetch':
-          // The viewer only hints when it has nothing else to ask for, so this
-          // is idle time: nothing is waiting behind the decode.
+          // The viewer only hints when it has nothing newer to ask for, so this
+          // is idle time; at worst the whole of the page on screen, asked for
+          // once the controls rest, waits behind this one decode.
           document.prefetch(Number(msg.index));
           break;
         case 'copy':

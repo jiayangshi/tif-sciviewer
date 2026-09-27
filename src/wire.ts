@@ -76,6 +76,12 @@ export function clipRegion(r: unknown, width: number, height: number): Region | 
   return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
 }
 
+/**
+ * Pages at least this big travel as previews while a stack is moving; below it
+ * the whole page is cheap enough to send every time.
+ */
+export const PREVIEW_MIN_BYTES = 8 * 1024 * 1024;
+
 /** Dimensions of a slice sampled at every `step`-th pixel in each direction. */
 export function sampledSize(width: number, height: number, step: number): { width: number; height: number } {
   return { width: Math.ceil(width / step), height: Math.ceil(height / step) };

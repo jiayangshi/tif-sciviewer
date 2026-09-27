@@ -4,6 +4,22 @@ All notable changes to this extension are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Reading ahead no longer pushes the slice on screen out of the cache when a
+  single slice is over half of it (8192² float32, 6000² uint16, 4096² RGB),
+  which had every pause in a stack decode that slice twice.
+- Save PNG pressed while the next slice was still on its way was silently
+  dropped. It now saves that slice, at full resolution.
+- When the slice the controls stop on cannot be read, it is not asked for again
+  until the controls move, and the preview on screen still gets its whole slice.
+- A page too small to gain from a preview - a thumbnail in a multi-page file of
+  full slices, say - is always sent whole, instead of blocky.
+- A 16- or 32-bit strip with predictor 2 that decompresses short is reported
+  as an error again, instead of its missing rows reading as zero.
+
 ## [0.1.2] - 2026-09-27
 
 Third release.

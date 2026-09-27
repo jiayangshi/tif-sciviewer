@@ -915,6 +915,49 @@ describe('previews while moving through a large stack', () => {
     assert.deepEqual(encoded, [PW], 'encoded from the full-resolution surface');
   });
 
+  test('Save PNG pressed while the next page is on its way saves that page, whole', () => {
+    const h = open();
+    move(h, 1);
+    serve(h, src);
+    move(h, 2); // page 2 is asked for; page 1's preview is still on screen
+    h.$('btn-save').click();
+    serve(h, src);
+    const saves = h.posted.filter(m => m.type === 'savePng');
+    assert.equal(saves.length, 1, 'the save must not be lost');
+    assert.equal(Number(saves[0].sliceIndex), 2, 'the page the controls are on');
+  });
+
+  test('when the page the controls stop on fails, the preview on screen still gets its whole slice', () => {
+    const h = open();
+    move(h, 1);
+    serve(h, src);
+    move(h, 2);
+    h.served = h.posted.length; // the host answers page 2 with an error instead
+    h.send({ type: 'error', message: 'slice 3 is damaged', fatal: false, index: 2 });
+    h.runTimers();
+    serve(h, src);
+    const asked = h.posted.filter(m => m.type === 'requestSlice').map(m => [m.index, m.step ?? 1]);
+    assert.deepEqual(asked, [[1, STEP], [2, STEP], [1, 1]], 'page 1 upgraded, page 2 not asked for again');
+    assert.equal(surfaceOf(h, PW)._lastImageData !== null, true);
+
+    // Its whole slice failing too does not start a loop.
+    const before = h.posted.length;
+    h.runTimers();
+    assert.equal(h.posted.length, before);
+  });
+
+  test('a failure while the settle timer has already fired still leads to the whole slice', () => {
+    const h = open();
+    move(h, 1);
+    serve(h, src);
+    move(h, 2);
+    h.runTimers(); // fires while page 2 is still out, so it can do nothing yet
+    h.served = h.posted.length;
+    h.send({ type: 'error', message: 'slice 3 is damaged', fatal: false, index: 2 });
+    h.runTimers();
+    assert.deepEqual(lastRequest(h), { type: 'requestSlice', index: 1 }, 'page 1 is fetched whole');
+  });
+
   test('a save left waiting is dropped when the stack moves on', () => {
     const h = open();
     move(h, 1);

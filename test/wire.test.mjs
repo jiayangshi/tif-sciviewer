@@ -14,6 +14,9 @@ const {
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIX = path.join(HERE, 'fixtures');
 const source = name => new SliceSource(new BufferReader(new Uint8Array(fs.readFileSync(path.join(FIX, name)))));
+/** The same, with previews allowed for pages of any size, as the fixtures are small. */
+const previewSource = name => new SliceSource(
+  new BufferReader(new Uint8Array(fs.readFileSync(path.join(FIX, name)))), 64 * 1024 * 1024, 512 * 1024 * 1024, 0);
 
 describe('base64 wire format', () => {
   test('round-trips arbitrary bytes', () => {
@@ -106,6 +109,21 @@ describe('SliceSource', () => {
     src.getSlice(1); src.getSlice(2);
     src.prefetch(1);
     assert.deepEqual(src.cachedPages, [1, 2], 'a hit leaves page 1 first in line for eviction');
+  });
+
+  test('prefetch never pushes out the page on screen', () => {
+    // A budget of one and a half pages: the page just served and a prefetched
+    // one cannot both stay, and the served one is about to be asked for whole.
+    const one = 96 * 64;
+    const src = new SliceSource(new BufferReader(new Uint8Array(fs.readFileSync(path.join(FIX, 'stack_f32.tif')))), one * 1.5);
+    src.getSlice(1);
+    assert.equal(src.prefetch(2), false, 'skipped: it would evict page 1');
+    assert.deepEqual(src.cachedPages, [1]);
+
+    const roomy = new SliceSource(new BufferReader(new Uint8Array(fs.readFileSync(path.join(FIX, 'stack_f32.tif')))), one * 2);
+    roomy.getSlice(1);
+    assert.equal(roomy.prefetch(2), true, 'with room for both, it reads ahead');
+    assert.deepEqual(roomy.cachedPages, [1, 2]);
   });
 
   test('prefetch ignores pages that do not exist rather than throwing', () => {
@@ -318,7 +336,7 @@ describe('previews while a stack is moving', () => {
   });
 
   test('a region payload says which part it covers', () => {
-    const src = source('big_f32_lzw.tif');
+    const src = previewSource('big_f32_lzw.tif');
     const full = src.getSlice(0).data;
     const r = { x: 17, y: 5, width: 64, height: 32 };
     const p = src.payload(0, 'binary', 1, r);
@@ -331,8 +349,15 @@ describe('previews while a stack is moving', () => {
       'a region covering everything is the whole slice');
   });
 
+  test('a page too small to be worth previewing is always sent whole', () => {
+    const p = source('big_f32_lzw.tif').payload(0, 'binary', 4, { x: 0, y: 0, width: 10, height: 10 });
+    assert.equal(p.step, 1, 'a 640x512 page is cheap to send, and a multi-page file can mix sizes');
+    assert.equal(p.region, undefined);
+    assert.equal(p.pixels.byteLength, 640 * 512 * 4);
+  });
+
   test('a preview payload is small, but its statistics are the whole slice', () => {
-    const src = source('big_f32_lzw.tif');
+    const src = previewSource('big_f32_lzw.tif');
     const full = src.payload(0);
     const preview = src.payload(0, 'binary', 4);
     assert.equal(preview.step, 4);

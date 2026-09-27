@@ -214,6 +214,15 @@ Also found on the way:
   `requestAnimationFrame`, so a run stalled until it was launched with
   Chromium's no-backgrounding switches.
 
+An independent review of the change then found five real faults, each now
+pinned by a test that failed first: read-ahead evicting the slice on screen
+when one slice is over half the cache; Save PNG lost if pressed while the next
+slice was on its way; a failed slice asked for again by the settle timer, with
+the preview on screen never upgraded; previews sized from the page on screen,
+so a small page in a mixed-size file came out blocky; and predictor 2 silently
+zero-filling a short strip. It also found my read-ahead host test vacuous - the
+stack-window survey had already decoded every page before the hint arrived.
+
 Not done: decoding in worker threads. It would let compressed stacks decode in
 parallel and keep the extension host free, but it is a large change for a case
 (compressed 4k slices, ~200-300 ms each) that read-ahead already half-hides.

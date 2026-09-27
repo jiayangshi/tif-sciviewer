@@ -7,7 +7,9 @@ import { autoAdjust, stretchHistogram, resetRange, fromBrightnessContrast, toBri
 import { getLut, LUT_NAMES } from '../imagej/luts';
 import { mapTo8Bit, composeRGBA, renderColor, formatValue } from '../imagej/render';
 import { DType, NumericArray } from '../tiff/types';
-import { payloadBytes, viewOf, SlicePayload, PixelEncoding, Region, sampledSize, elementSize } from '../wire';
+import {
+  payloadBytes, viewOf, SlicePayload, PixelEncoding, Region, sampledSize, elementSize, PREVIEW_MIN_BYTES,
+} from '../wire';
 
 declare function acquireVsCodeApi(): {
   postMessage(msg: unknown): void;
@@ -52,11 +54,6 @@ interface InitMessage {
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
-/**
- * Slices at least this big travel as previews while the stack is moving; below
- * it the whole slice is cheap enough to send every time.
- */
-const PREVIEW_MIN_BYTES = 8 * 1024 * 1024;
 /** Coarsest preview; past this the saving no longer matters. */
 const MAX_PREVIEW_STEP = 16;
 /** How long the stack controls stay still before a preview is replaced by the whole slice. */
@@ -81,6 +78,8 @@ class Viewer {
   private wantedIndex = 0;
   /** The page asked of the host and not yet answered. */
   private inFlight: number | undefined;
+  /** A page the host could not serve; not asked for again until the controls move. */
+  private failedIndex: number | undefined;
   private encoding: PixelEncoding = 'binary';
   /** 1 when the data on screen has every pixel; otherwise the preview's sampling step. */
   private shownStep = 1;
@@ -161,9 +160,13 @@ class Viewer {
     } else if (msg.type === 'error') {
       if (msg.index === undefined || msg.index === this.inFlight) {
         this.inFlight = undefined;
-        // Move on if the controls have, but never straight back to the page
-        // that just failed - that would ask for it forever.
-        if (msg.index !== undefined && msg.index !== this.wantedIndex) this.fetchWanted();
+        if (msg.index !== undefined) {
+          this.failedIndex = msg.index;
+          // Move on if the controls have; if not, the page on screen is where
+          // the viewer stays, and a preview there still gets its whole slice.
+          this.fetchWanted();
+          this.scheduleUpgrade();
+        }
       }
       this.showError(msg.message, msg.fatal);
     }
@@ -180,12 +183,22 @@ class Viewer {
    */
   private fetchWanted(upgrade = false) {
     if (this.inFlight !== undefined) return;
-    if (this.wantedIndex !== this.sliceIndex) {
+    const target = this.targetIndex();
+    if (target !== this.sliceIndex) {
       const step = this.previewStep();
-      this.request(this.wantedIndex, step, this.previewRegion(step));
-    } else if (upgrade && this.isPreview()) {
+      this.request(target, step, this.previewRegion(step));
+    } else if (upgrade && this.isPreview() && this.sliceIndex !== this.failedIndex) {
       this.request(this.sliceIndex, 1);
     }
+  }
+
+  /**
+   * The page the viewer is working towards: the one the controls point at,
+   * unless the host has just failed on it - then the one on screen, so a
+   * failure is not asked for again and again.
+   */
+  private targetIndex(): number {
+    return this.wantedIndex === this.failedIndex ? this.sliceIndex : this.wantedIndex;
   }
 
   private readAhead() {
@@ -288,6 +301,8 @@ class Viewer {
     // during a drag, when there is always something newer and a read-ahead
     // would only hold it up.
     if (moved && this.inFlight === undefined) this.readAhead();
+    // A save is waiting on this page, so fetch the whole of it now, not after the pause.
+    if (this.pendingSave === this.sliceIndex && this.isPreview()) this.fetchWanted(true);
     this.scheduleUpgrade();
 
     this.width = msg.width;
@@ -589,6 +604,7 @@ class Viewer {
     const next = clamp(this.pageIndex(), 0, this.init!.pageCount - 1);
     if (next !== this.wantedIndex) {
       this.pendingSave = undefined; // it was for the page left behind
+      this.failedIndex = undefined; // coming back to it tries again
       this.lastStride = next - this.wantedIndex;
     }
     this.wantedIndex = next;
@@ -918,8 +934,9 @@ class Viewer {
   private savePng() {
     if (!this.width || !this.surface) return;
     if (this.isPreview()) {
-      // A preview is on screen: save at full resolution once the whole slice is in.
-      this.pendingSave = this.sliceIndex;
+      // A preview is on screen: save at full resolution once the whole slice
+      // is in - of the page the controls are on, which may still be on its way.
+      this.pendingSave = this.targetIndex();
       this.fetchWanted(true);
       return;
     }

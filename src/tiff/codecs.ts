@@ -125,6 +125,10 @@ export function undoHorizontalPredictor(
     throw new Error(`Predictor 2 is not defined for ${bitsPerSample}-bit samples`);
   }
   const bytes = bitsPerSample / 8;
+  if (data.byteLength < height * rowVals * bytes) {
+    // A truncated strip. Name it, rather than let the rows it lacks read as zero.
+    throw new Error(`Predictor 2 data is shorter than its ${height} rows (${data.byteLength} bytes)`);
+  }
   // In host byte order a typed array does the arithmetic, and wraps on store.
   if (littleEndian === HOST_LE && data.byteOffset % bytes === 0) {
     const n = (data.byteLength / bytes) | 0;
