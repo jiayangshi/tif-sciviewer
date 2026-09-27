@@ -10,6 +10,8 @@ out/
 
 # generated test inputs (recreate with `npm run fixtures`)
 test/fixtures/
+# large 4096x4096 stacks for trying stack performance by hand
+test/samples/
 sample.tif
 
 # research data stays out of the repository

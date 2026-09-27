@@ -6,6 +6,52 @@ All notable changes to this extension are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Reading ahead no longer pushes the slice on screen out of the cache when a
+  single slice is over half of it (8192² float32, 6000² uint16, 4096² RGB),
+  which had every pause in a stack decode that slice twice.
+- Save PNG pressed while the next slice was still on its way was silently
+  dropped. It now saves that slice, at full resolution.
+- When the slice the controls stop on cannot be read, it is not asked for again
+  until the controls move, and the preview on screen still gets its whole slice.
+- A page too small to gain from a preview - a thumbnail in a multi-page file of
+  full slices, say - is always sent whole, instead of blocky.
+- A 16- or 32-bit strip with predictor 2 that decompresses short is reported
+  as an error again, instead of its missing rows reading as zero.
+
+## [0.1.2] - 2026-09-27
+
+Third release.
+
+### Changed
+
+- **Browsing a stack of large slices keeps up.** On 4096x4096 float32 files a
+  step took over half a second, and a drag kept the image moving for seconds
+  after the hand stopped, because every slider position was decoded and sent in
+  turn. Measured in VS Code: a step now takes about 20 ms, and a drag lands on
+  the slice under the slider as soon as it stops.
+  - At most one slice is on its way at a time; when it lands, the viewer asks
+    for wherever the controls are by then and skips what they passed.
+  - Pixels travel to the webview as binary instead of an 85 MB base64 string,
+    falling back to base64 by itself on a transport that mangles binary.
+  - While the stack moves, only what the screen can show is sent - one sample
+    per device pixel of the part in view - and the whole slice follows once the
+    controls rest. The readout shows coordinates only where the preview does not
+    hold that exact pixel, and Save PNG waits for the whole slice.
+  - The host reads ahead one slice in the direction of travel when it would
+    otherwise be idle.
+  - The histogram pass is about 1.7x quicker, and LZW decoding about 3x.
+
+### Fixed
+
+- In a hyperstack, a slice that arrived after the channel slider had moved on
+  was given the range of the channel on the slider rather than its own.
+
+## [0.1.1] - 2026-09-16
+
+Second release.
+
 ### Added
 
 - **Open as Stack**: select several single-slice `.tif` files in the Explorer

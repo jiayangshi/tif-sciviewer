@@ -59,6 +59,85 @@ describe('ImageStatistics matches the Python transcription bin for bin', () => {
   }
 });
 
+/**
+ * The histogram pass takes shortcuts once the first pass has shown there is no
+ * NaN or Inf. This is the plain transcription of FloatStatistics/ShortStatistics
+ * binning it has to agree with, pixel for pixel.
+ */
+function naiveHistogram(data, dtype, channels = 1, channel = -1) {
+  const start = channel >= 0 ? channel : 0, step = channel >= 0 ? channels : 1;
+  let min = Infinity, max = -Infinity;
+  for (let i = start; i < data.length; i += step) {
+    const v = data[i];
+    if (!Number.isFinite(v)) continue;
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  const eightBit = dtype === 'uint8' || dtype === 'int8';
+  const integer = dtype !== 'float32' && dtype !== 'float64';
+  const histMin = eightBit ? (dtype === 'int8' ? -128 : 0) : min;
+  const scale = eightBit ? 1 : integer ? 256 / (max - min + 1) : (max > min ? 256 / (max - min) : 0);
+  const h = new Array(256).fill(0);
+  for (let i = start; i < data.length; i += step) {
+    const v = data[i];
+    if (!Number.isFinite(v)) continue;
+    let idx = Math.trunc(scale * (v - histMin)); // Java's (int) cast
+    if (idx > 255) idx = 255;
+    if (idx < 0) idx = 0;
+    h[idx]++;
+  }
+  return h;
+}
+
+describe('the fast statistics pass agrees with the plain one', () => {
+  // Deterministic, not Math.random, so a failure reproduces.
+  let seed = 12345;
+  const rand = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  const cases = [
+    ['float32', () => Float32Array.from({ length: 20011 }, () => rand() * 7 - 3)],
+    ['float64', () => Float64Array.from({ length: 20011 }, () => (rand() - 0.5) * 1e12)],
+    ['uint16', () => Uint16Array.from({ length: 20011 }, () => Math.floor(rand() * 65536))],
+    ['int16', () => Int16Array.from({ length: 20011 }, () => Math.floor(rand() * 65536) - 32768)],
+    ['uint32', () => Uint32Array.from({ length: 20011 }, () => Math.floor(rand() * 4294967295))],
+    ['int32', () => Int32Array.from({ length: 20011 }, () => Math.floor(rand() * 4e9) - 2e9)],
+    ['uint8', () => Uint8Array.from({ length: 20011 }, () => Math.floor(rand() * 256))],
+    ['int8', () => Int8Array.from({ length: 20011 }, () => Math.floor(rand() * 256) - 128)],
+  ];
+  for (const [dtype, make] of cases) {
+    test(dtype, () => {
+      const data = make();
+      assert.deepEqual(Array.from(computeStats(data, dtype).histogram), naiveHistogram(data, dtype));
+    });
+  }
+
+  test('the value at the top of the range lands in the last bin, not past it', () => {
+    const data = Float32Array.from([0, 0.25, 0.5, 1, 1, 1]);
+    const h = computeStats(data, 'float32').histogram;
+    assert.equal(h[255], 3);
+    assert.deepEqual(Array.from(h), naiveHistogram(data, 'float32'));
+  });
+
+  test('with NaN and Inf present, they are left out of the bins', () => {
+    const data = Float32Array.from({ length: 5003 }, () => rand() * 10);
+    data[7] = NaN; data[100] = Infinity; data[4000] = -Infinity;
+    const s = computeStats(data, 'float32');
+    assert.equal(s.nonFiniteCount, 3);
+    assert.deepEqual(Array.from(s.histogram), naiveHistogram(data, 'float32'));
+  });
+
+  test('one channel of interleaved samples', () => {
+    const data = Uint16Array.from({ length: 3 * 4001 }, () => Math.floor(rand() * 4000));
+    for (const c of [0, 1, 2]) {
+      assert.deepEqual(Array.from(computeStats(data, 'uint16', 3, c).histogram), naiveHistogram(data, 'uint16', 3, c));
+    }
+  });
+
+  test('a flat image puts every pixel in bin 0', () => {
+    const h = computeStats(new Float32Array(100).fill(2.5), 'float32').histogram;
+    assert.equal(h[0], 100);
+  });
+});
+
 describe('ContrastAdjuster.autoAdjust', () => {
   for (const [name, ref] of Object.entries(truth)) {
     const file = fixturePath(name);

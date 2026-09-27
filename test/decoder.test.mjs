@@ -149,3 +149,120 @@ describe('the generated sample slice', () => {
       `mean ${mean} should sit far below the midpoint of [${min}, ${max}]`);
   });
 });
+
+/**
+ * A reference TIFF LZW encoder: MSB-first codes, a clear code first, the width
+ * growing one code early, and a clear whenever the table fills - what libtiff
+ * writes. Lets the decoder be checked on inputs chosen to hit its edge cases,
+ * not only on what tifffile happened to produce.
+ */
+function lzwEncode(data) {
+  const bytes = [];
+  let acc = 0, accBits = 0, width = 9;
+  const put = code => {
+    acc = (acc << width) | code; accBits += width;
+    while (accBits >= 8) { bytes.push((acc >>> (accBits - 8)) & 0xff); accBits -= 8; }
+    acc &= (1 << accBits) - 1;
+  };
+  let dict = new Map();
+  let next = 258;
+  const reset = () => { dict = new Map(); next = 258; width = 9; };
+  put(256);
+  let w = -1;
+  for (const b of data) {
+    if (w < 0) { w = b; continue; }
+    const key = w * 256 + b;
+    const hit = dict.get(key);
+    if (hit !== undefined) { w = hit; continue; }
+    put(w);
+    dict.set(key, next++);
+    // The decoder defines each entry one code after the encoder does, so the
+    // encoder's "one code early" is when its next free code reaches the power of two.
+    if (next === 512) width = 10;
+    else if (next === 1024) width = 11;
+    else if (next === 2048) width = 12;
+    if (next === 4094) { put(256); reset(); }
+    w = b;
+  }
+  if (w >= 0) put(w);
+  put(257);
+  if (accBits > 0) bytes.push((acc << (8 - accBits)) & 0xff);
+  return Uint8Array.from(bytes);
+}
+
+/** The chain-walking decoder this one replaced, kept as the reference. */
+function lzwDecodeByChains(input, expectedLength) {
+  const out = new Uint8Array(expectedLength);
+  let outPos = 0;
+  const prefix = new Int32Array(4096), suffix = new Uint8Array(4096);
+  for (let i = 0; i < 256; i++) { prefix[i] = -1; suffix[i] = i; }
+  let next = 258, width = 9, bitPos = 0, old = -1;
+  const total = input.length * 8;
+  const read = () => {
+    if (bitPos + width > total) return 257;
+    let c = 0;
+    for (let i = 0; i < width; i++) c = (c << 1) | ((input[(bitPos + i) >> 3] >> (7 - ((bitPos + i) & 7))) & 1);
+    bitPos += width;
+    return c;
+  };
+  const chain = code => { const s = []; for (let c = code; c >= 0; c = prefix[c]) s.push(suffix[c]); return s.reverse(); };
+  const emit = s => { for (const b of s) if (outPos < expectedLength) out[outPos++] = b; };
+  for (;;) {
+    const code = read();
+    if (code === 257) break;
+    if (code === 256) { next = 258; width = 9; old = -1; continue; }
+    let s;
+    if (old < 0) s = chain(code);
+    else if (code < next) s = chain(code);
+    else { const o = chain(old); s = [...o, o[0]]; }
+    emit(s);
+    if (old >= 0 && next < 4096) { prefix[next] = old; suffix[next] = s[0]; next++; }
+    old = code;
+    if (next + 1 === 512) width = 10; else if (next + 1 === 1024) width = 11; else if (next + 1 === 2048) width = 12;
+    if (outPos >= expectedLength) break;
+  }
+  return out;
+}
+
+describe('predictors on damaged data', () => {
+  test('predictor 2 refuses a 16-bit strip shorter than its rows, rather than zero-filling it', () => {
+    // What a truncated Deflate strip decompresses to: fewer bytes than it should be.
+    const short = new Uint8Array(4 * 3 * 2 - 6);
+    assert.throws(() => lib.undoHorizontalPredictor(short, 4, 3, 1, 16, true), /shorter/);
+    assert.throws(() => lib.undoHorizontalPredictor(new Uint8Array(4 * 3 * 4 - 4), 4, 3, 1, 32, true), /shorter/);
+  });
+});
+
+describe('LZW', () => {
+  let seed = 7;
+  const rand = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  const inputs = {
+    'random bytes, which fill the table and force clears': Uint8Array.from({ length: 200000 }, () => rand() * 256),
+    'one long run, the KwKwK case over and over': new Uint8Array(100000).fill(42),
+    'a few symbols, deep dictionary chains': Uint8Array.from({ length: 150000 }, () => (rand() < 0.9 ? 0 : 1 + (rand() * 3 | 0))),
+    'float32 CT-like rows': new Uint8Array(Float32Array.from({ length: 60000 }, (_, i) => (i % 900 < 150 ? -1 : -0.7 + (i % 37) * 1e-3)).buffer),
+    'short inputs': Uint8Array.from([1, 2, 1, 2, 1, 2, 1]),
+  };
+  for (const [name, data] of Object.entries(inputs)) {
+    test(`round-trips ${name}`, () => {
+      const packed = lzwEncode(data);
+      const back = lib.lzwDecode(packed, data.length);
+      assert.equal(Buffer.compare(Buffer.from(back), Buffer.from(data)), 0);
+      assert.equal(Buffer.compare(Buffer.from(back), Buffer.from(lzwDecodeByChains(packed, data.length))), 0);
+    });
+  }
+
+  test('stops at the expected length, and pads a stream that ends early', () => {
+    const data = inputs['random bytes, which fill the table and force clears'];
+    const packed = lzwEncode(data);
+    const shorter = lib.lzwDecode(packed, 1000);
+    assert.equal(Buffer.compare(Buffer.from(shorter), Buffer.from(data.subarray(0, 1000))), 0);
+    for (const cut of [1, 17, 1000, packed.length >> 1, packed.length - 3]) {
+      const truncated = packed.subarray(0, cut);
+      const got = lib.lzwDecode(truncated, data.length);
+      assert.equal(got.length, data.length, 'always the size asked for');
+      assert.equal(Buffer.compare(Buffer.from(got), Buffer.from(lzwDecodeByChains(truncated, data.length))), 0,
+        `cut at ${cut} bytes`);
+    }
+  });
+});

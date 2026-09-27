@@ -146,6 +146,87 @@ rendering across float32, int16 Hounsfield, RGB, stacks and NaN images.
 
 **197 tests, all passing.**
 
+## 11 — Scrubbing a stack of 4096² slices
+
+Reported: sliding through a stack of 4096x4096 files was very laggy. The guess
+was that the whole stack was being loaded; it was not - only headers are read
+up front. Measured in VS Code itself instead, by driving the real webview over
+the Chrome DevTools Protocol in an isolated instance with the extension under
+development, and profiling the extension host, workbench and webview together.
+
+A step took 537 ms, and a quick drag over ten slices kept the image moving for
+3.9 s after it stopped. Three causes, largest first:
+
+1. **No backpressure.** Every `input` event of the slider asked for a slice, and
+   every one was decoded, sent and drawn in turn. Now at most one is on its way;
+   when it lands the viewer asks for wherever the controls are by then - what
+   ImageJ's `StackWindow` does. The next request goes out before the arrived
+   slice is drawn, so the host decodes while the webview draws.
+2. **Base64.** An 85 MB string per slice, built, stringified, parsed, and decoded
+   char by char in the webview: ~270 ms. The worry that binary is unsafe over
+   Remote-SSH was checked against VS Code's own source: for `engines.vscode` >=
+   1.57 it lifts typed arrays out of the message and ships them as bytes on
+   every transport. It matches views by constructor name - a Node `Buffer`
+   would silently go as JSON - and sends the whole backing `ArrayBuffer`, so
+   pixels go as a tight plain `Uint8Array`. A webview that sees them arrive
+   broken asks for base64 from then on.
+3. **Moving 64 MB at all.** Even as binary, VS Code relays the bytes through
+   the workbench's own UI thread (~80 ms a slice, which stalls the whole
+   window) and the webview mapped 16M pixels (~40 ms). While the stack moves,
+   only one sample per device pixel of the part in view is sent now; after
+   200 ms at rest the whole slice follows, for the readout, zoom and Save PNG.
+
+Then the host's own time dominated (decode + statistics ≈ 55 ms), so the
+viewer hints the host to read ahead one slice in the direction of travel, but
+only when it has nothing newer to ask for - during a drag a read-ahead would
+only hold up the page the slider is on.
+
+| 4096² float32, 8 files, in VS Code | before | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| one arrow-key step | 537 ms | 214 | 85 | 19 | 23 |
+| one step at 100% zoom | — | — | 165 | — | **12** |
+| image still moving after a drag | 3897 ms | 188 | 49 | 23 | **14** |
+| after holding an arrow key | 2257 ms | 263 | 119 | 98 | 107 |
+
+(1 = one request at a time + binary; 2 = previews; 3 = read-ahead; 4 = previews
+cropped to the view when zoomed in.) The harness grew along the way, so the
+end points were measured again with its final version, against the original
+commit built in a worktree: a step 550 -> 17 ms, a step at 100% 584 -> 14 ms,
+after a drag 2.1 s -> 46 ms, after holding an arrow key 4.0 s -> 109 ms. The
+webview heap went from 311 to 232 MB and the extension host from 515 to 417 MB.
+
+Also found on the way:
+
+- A hyperstack slice that arrived after the channel slider had moved on was
+  windowed with the slider's channel range, not its own. The channel now comes
+  from the page that arrived.
+- The histogram pass tested every pixel for NaN and floored every bin index
+  even when the first pass had already shown there were no NaN/Inf; skipping
+  that is 1.7-4x quicker and bit-identical. Four-way unrolled sums were tried
+  next and were *slower* in V8 for float32, so they were not kept.
+- LZW walked every dictionary chain backwards and read codes a bit at a time.
+  Each entry is the previous code's string plus one byte, which already sits in
+  the output, so an entry is now a start and a length and emitting it is a
+  forward copy: 3x quicker (570 -> 189 ms for a 4096² float32 slice). A
+  reference encoder in the tests found my own first version of it wrong about
+  when to widen codes; the decoder was right.
+- The harness itself: a VS Code window behind others stops
+  `requestAnimationFrame`, so a run stalled until it was launched with
+  Chromium's no-backgrounding switches.
+
+An independent review of the change then found five real faults, each now
+pinned by a test that failed first: read-ahead evicting the slice on screen
+when one slice is over half the cache; Save PNG lost if pressed while the next
+slice was on its way; a failed slice asked for again by the settle timer, with
+the preview on screen never upgraded; previews sized from the page on screen,
+so a small page in a mixed-size file came out blocky; and predictor 2 silently
+zero-filling a short strip. It also found my read-ahead host test vacuous - the
+stack-window survey had already decoded every page before the hint arrived.
+
+Not done: decoding in worker threads. It would let compressed stacks decode in
+parallel and keep the extension host free, but it is a large change for a case
+(compressed 4k slices, ~200-300 ms each) that read-ahead already half-hides.
+
 ## Known gaps
 
 Deliberately not built, with the reasoning:

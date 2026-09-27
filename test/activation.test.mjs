@@ -344,8 +344,7 @@ describe('a stack document, end to end through the extension host', () => {
       const payload = doc.slicePayload(n);
       assert.equal(payload.width, W);
       assert.equal(payload.height, H);
-      const bytes = new Uint8Array(Buffer.from(payload.base64, 'base64'));
-      const values = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+      const values = lib.viewOf(lib.payloadBytes(payload), 'float32', payload.littleEndian);
       assert.equal(values[probe], expectedValue(W, H, probe, n, COUNT), `slice ${n}`);
     }
     doc.dispose();
@@ -449,6 +448,89 @@ describe('a stack document, end to end through the extension host', () => {
     panel.send({ type: 'requestSlice', index: 4 });
     const slice = panel.posted.filter(m => m.type === 'slice').at(-1);
     assert.equal(slice.index, 4);
+    doc.dispose();
+  });
+
+  test('slice requests choose their encoding and sampling, within bounds', async () => {
+    // Pages of 8 MB, the smallest the host will send as previews.
+    const BW = 2048, BH = 1024;
+    const big = [0, 1].map(n => writeSliceTif(path.join(dir, 'big', `b_${n}.tif`), {
+      width: BW, height: BH, pixels: Float32Array.from({ length: BW * BH }, (_, i) => (i % 977) + n),
+    }));
+    const { provider, uri } = await openStack(big, { autoContrastOnOpen: false });
+    const doc = await provider.openCustomDocument(uri);
+    const panel = fakePanel();
+    await provider.resolveCustomEditor(doc, panel, {});
+    panel.send({ type: 'ready' });
+    const ask = msg => { panel.send({ type: 'requestSlice', ...msg }); return panel.posted.at(-1); };
+
+    const plainSlice = ask({ index: 1 });
+    assert.equal(plainSlice.pixels.constructor.name, 'Uint8Array', 'binary by default');
+    assert.equal(plainSlice.base64, undefined);
+    assert.equal(plainSlice.step, 1);
+
+    const text = ask({ index: 1, encoding: 'base64' });
+    assert.equal(text.pixels, undefined);
+    assert.deepEqual(Buffer.from(lib.payloadBytes(text)), Buffer.from(plainSlice.pixels));
+
+    const preview = ask({ index: 1, step: 4 });
+    assert.equal(preview.step, 4);
+    assert.equal(preview.width, BW, 'the slice keeps its own dimensions');
+    assert.equal(preview.pixels.byteLength, (BW / 4) * (BH / 4) * 4);
+
+    const crop = ask({ index: 1, region: { x: 4, y: 2, width: 10, height: 6 } });
+    assert.deepEqual(crop.region, { x: 4, y: 2, width: 10, height: 6 });
+    assert.equal(crop.pixels.byteLength, 10 * 6 * 4);
+    assert.equal(ask({ index: 1, region: { x: 'a' } }).region, undefined, 'a nonsense region means all of it');
+
+    assert.equal(ask({ index: 1, step: 'lots' }).step, 1, 'nonsense means every pixel');
+    assert.equal(ask({ index: 1, step: -3 }).step, 1);
+    assert.equal(ask({ index: 1, step: 1e9 }).step, 64, 'and there is a limit');
+    doc.dispose();
+
+    // A small page is sent whole whatever is asked, as a file can mix page sizes.
+    const small = await openStack();
+    const sdoc = await small.provider.openCustomDocument(small.uri);
+    const spanel = fakePanel();
+    await small.provider.resolveCustomEditor(sdoc, spanel, {});
+    spanel.send({ type: 'ready' });
+    spanel.send({ type: 'requestSlice', index: 2, step: 4, region: { x: 1, y: 1, width: 5, height: 5 } });
+    const whole = spanel.posted.at(-1);
+    assert.equal(whole.step, 1);
+    assert.equal(whole.region, undefined);
+    assert.equal(whole.pixels.byteLength, W * H * 4);
+    sdoc.dispose();
+  });
+
+  test('a read-ahead hint decodes quietly, and the request after it is served', async () => {
+    // No auto-contrast on open, so no survey decodes page 3 before the hint does.
+    const { provider, uri } = await openStack(paths, { autoContrastOnOpen: false });
+    const doc = await provider.openCustomDocument(uri);
+    const panel = fakePanel();
+    await provider.resolveCustomEditor(doc, panel, {});
+    panel.send({ type: 'ready' });
+    const before = panel.posted.length;
+    panel.send({ type: 'prefetch', index: 3 });
+    panel.send({ type: 'prefetch', index: 999 });
+    assert.equal(panel.posted.length, before, 'a hint gets no reply, not even for a bad page');
+    assert.equal(doc.prefetch(3), false, 'page 3 is already decoded');
+    assert.equal(doc.prefetch(4), true, 'while a page nobody hinted at was not');
+    panel.send({ type: 'requestSlice', index: 3 });
+    assert.equal(panel.posted.at(-1).index, 3);
+    doc.dispose();
+  });
+
+  test('a slice that cannot be served says which one it was', async () => {
+    const { provider, uri } = await openStack();
+    const doc = await provider.openCustomDocument(uri);
+    const panel = fakePanel();
+    await provider.resolveCustomEditor(doc, panel, {});
+    panel.send({ type: 'ready' });
+    panel.send({ type: 'requestSlice', index: COUNT + 3 });
+    const err = panel.posted.at(-1);
+    assert.equal(err.type, 'error');
+    assert.equal(err.index, COUNT + 3, 'the viewer matches it to the request it has out');
+    assert.equal(err.fatal, false);
     doc.dispose();
   });
 

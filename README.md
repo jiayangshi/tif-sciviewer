@@ -61,9 +61,14 @@ Built for the "processing runs on a remote box" workflow:
   where the files are. Nothing large crosses the SSH link except one slice.
 - Pages are decoded lazily and cached with a pixel budget, so a multi-gigabyte
   stack does not have to fit in memory.
-- Pixel data reaches the webview as base64 rather than a transferred
-  `ArrayBuffer`, because structured clone of binary is not dependable across
-  every VS Code transport (Remote-SSH, vscode.dev).
+- Pixel data reaches the webview as binary: VS Code lifts typed arrays out of
+  webview messages and ships them as bytes over every transport it runs the
+  extension host behind. Should a transport ever mangle them, the viewer
+  notices and switches to base64 by itself.
+- While a stack is moving, only what the screen can show travels: one sample
+  per device pixel of the part in view. Once the controls rest for 200 ms the
+  whole slice follows, so the pixel readout, zooming in and Save PNG are always
+  exact. Statistics and the histogram are always of the whole slice.
 - `tifSciviewer.maxDecodedMegabytes` (default 512) refuses an oversized page
   with a clear message rather than exhausting the login node.
 
@@ -118,6 +123,20 @@ Measured on a 2021 laptop; see `docs/ITERATIONS.md` for the profiling.
 | Decode a 2048² float32 page | ~5 ms warm |
 | Re-map 2048² on a slider drag | ~20 ms per frame |
 
+A stack of 4096² float32 files, measured in VS Code itself (the real webview,
+transport and extension host), end to end from the key press to the new slice
+on screen:
+
+| | before | now |
+|---|---|---|
+| One step with an arrow key | 550 ms | **17 ms** |
+| One step, zoomed to 100% | 584 ms | **14 ms** |
+| Image still moving after a quick drag stops | 2.1 s | **46 ms** |
+| Image still moving after holding an arrow key | 4.0 s | **109 ms** |
+
+Stepping is fast because the viewer keeps one request out at a time and skips
+the slices a drag passes over (as ImageJ's stack window does), previews what
+the screen can show, and has the host read ahead in the direction of travel.
 Pages are decoded on demand, so the file never has to fit in memory.
 
 ## Development

@@ -6,10 +6,13 @@ import { TiffFile, ByteReader } from './tiff/decoder';
 import { PageMeta, StackMeta, NumericArray } from './tiff/types';
 import { computeStats, Stats } from './imagej/stats';
 import { autoAdjust, Range } from './imagej/contrast';
-import { SlicePayload, SerializableStats, toBase64, isLittleEndianHost } from './wire';
+import {
+  SlicePayload, SerializableStats, PixelEncoding, Region, toBase64, isLittleEndianHost, sampledSize, clipRegion,
+  PREVIEW_MIN_BYTES,
+} from './wire';
 import { PageProvider } from './sequence';
 
-export type { SlicePayload, SerializableStats } from './wire';
+export type { SlicePayload, SerializableStats, PixelEncoding } from './wire';
 
 /** A reader yields bytes; a provider already knows how to page. */
 function isPageProvider(source: ByteReader | PageProvider): source is PageProvider {
@@ -49,6 +52,8 @@ export class SliceSource {
     source: ByteReader | PageProvider,
     private maxCachedValues = 64 * 1024 * 1024,
     private maxDecodedBytes = 512 * 1024 * 1024,
+    /** Pages smaller than this are sent whole, whatever the viewer asks for. */
+    private minPreviewBytes = PREVIEW_MIN_BYTES,
   ) {
     if (isPageProvider(source)) {
       this.pages = source;
@@ -110,6 +115,30 @@ export class SliceSource {
   get cachedPages(): number[] { return [...this.cache.keys()]; }
 
   /**
+   * Decode a page before it is asked for, so stepping through a stack finds
+   * the next slice ready. Leaves any failure for the real request to report.
+   * True if it decoded.
+   *
+   * Never at the cost of the page most recently served, which is the one on
+   * screen: the viewer is about to ask for all of it in place of its preview.
+   * Where the two do not fit in the cache together - one slice over half the
+   * budget - reading ahead would only have that page decoded twice.
+   */
+  prefetch(index: number): boolean {
+    if (!Number.isInteger(index) || index < 0 || index >= this.pageCount || this.cache.has(index)) return false;
+    try {
+      const m = this.pages.meta(index);
+      let shown: CachedSlice | undefined;
+      for (const v of this.cache.values()) shown = v;
+      if (shown && shown.data.length + m.width * m.height * m.samplesPerPixel > this.maxCachedValues) return false;
+      this.getSlice(index);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * A display window that suits the whole stack rather than just its first
    * slice, one per channel.
    *
@@ -167,9 +196,22 @@ export class SliceSource {
     return windows.some(w => w) ? windows : undefined;
   }
 
-  payload(index: number): SlicePayload {
+  /**
+   * A slice for the webview. With a `step` above 1, or a `region`, only a
+   * preview travels (see subsample), but the statistics are always of the
+   * whole slice, so the histogram and any auto-contrast taken from it do not
+   * depend on what was sent.
+   */
+  payload(index: number, encoding: PixelEncoding = 'binary', step = 1, region?: unknown): SlicePayload {
     const { data, stats, meta } = this.getSlice(index);
-    const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    // The viewer chooses a preview from the page on screen, and the pages of
+    // one file can differ in size - a thumbnail among full slices, say. A page
+    // this small gains nothing from a preview, so it goes whole.
+    const whole = data.byteLength < this.minPreviewBytes;
+    const k = whole ? 1 : Math.max(1, Math.floor(step) || 1);
+    const r = whole ? undefined : clipRegion(region, meta.width, meta.height);
+    const sent = k > 1 || r ? subsample(data, meta.width, meta.height, meta.samplesPerPixel, k, r) : data;
+    const bytes = new Uint8Array(sent.buffer, sent.byteOffset, sent.byteLength);
     return {
       type: 'slice',
       index,
@@ -177,7 +219,9 @@ export class SliceSource {
       height: meta.height,
       samplesPerPixel: meta.samplesPerPixel,
       dtype: meta.dtype,
-      base64: toBase64(bytes),
+      ...(encoding === 'base64' ? { base64: toBase64(bytes) } : { pixels: ownBuffer(bytes) }),
+      step: k,
+      ...(r ? { region: r } : {}),
       littleEndian: isLittleEndianHost(),
       stats: serializeStats(stats),
     };
@@ -188,4 +232,40 @@ export class SliceSource {
     this.ownedReader?.close?.();
     this.pages.close?.();
   }
+}
+
+/**
+ * The pixel at the centre of every step x step block of a region (the whole
+ * slice by default) - nearest-neighbour thinning, so every value in the
+ * preview is one that was measured. With one sample per device pixel it draws
+ * the same as the full slice, which the GPU would thin the same way, at a
+ * fraction of the bytes to move. At step 1 it is a plain crop.
+ */
+export function subsample(
+  data: NumericArray, width: number, height: number, spp: number, step: number,
+  region: Region = { x: 0, y: 0, width, height },
+): NumericArray {
+  const size = sampledSize(region.width, region.height, step);
+  const out = new (data.constructor as new (n: number) => NumericArray)(size.width * size.height * spp);
+  const off = step >> 1;
+  const lastX = region.x + region.width - 1;
+  const lastY = region.y + region.height - 1;
+  let o = 0;
+  for (let y = 0; y < size.height; y++) {
+    const row = Math.min(lastY, region.y + y * step + off) * width;
+    for (let x = 0; x < size.width; x++) {
+      const i = (row + Math.min(lastX, region.x + x * step + off)) * spp;
+      for (let s = 0; s < spp; s++) out[o++] = data[i + s];
+    }
+  }
+  return out;
+}
+
+/**
+ * VS Code sends the whole ArrayBuffer behind a view, so a view into anything
+ * larger is copied down to its own bytes first. Decoded pages are allocated to
+ * size, so in practice this returns its argument.
+ */
+function ownBuffer(bytes: Uint8Array): Uint8Array {
+  return bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength ? bytes : bytes.slice();
 }

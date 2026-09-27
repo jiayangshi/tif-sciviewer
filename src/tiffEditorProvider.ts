@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { TiffDocument } from './tiffDocument';
 import { COMPRESSION_NAMES } from './tiff/types';
 import { pageHtml } from './webviewHtml';
+import { PixelEncoding } from './wire';
 
 export class TiffEditorProvider implements vscode.CustomReadonlyEditorProvider<TiffDocument> {
   public static readonly viewType = 'tifSciviewer.preview';
@@ -34,11 +35,13 @@ export class TiffEditorProvider implements vscode.CustomReadonlyEditorProvider<T
     // postMessage resolves false once the panel is gone; that is not an error.
     const post = (msg: unknown) => { void panel.webview.postMessage(msg); };
 
-    const sendSlice = (index: number) => {
+    // The error names its slice: the viewer has at most one request out at a
+    // time, and has to know which one was answered.
+    const sendSlice = (index: number, encoding: PixelEncoding = 'binary', step = 1, region?: unknown) => {
       try {
-        post(document.slicePayload(index));
+        post(document.slicePayload(index, encoding, step, region));
       } catch (e) {
-        post({ type: 'error', message: describe(e), fatal: index === 0 });
+        post({ type: 'error', message: describe(e), fatal: index === 0, index });
       }
     };
 
@@ -79,7 +82,18 @@ export class TiffEditorProvider implements vscode.CustomReadonlyEditorProvider<T
           break;
         }
         case 'requestSlice':
-          sendSlice(Number(msg.index) || 0);
+          sendSlice(
+            Number(msg.index) || 0,
+            msg.encoding === 'base64' ? 'base64' : 'binary',
+            Math.min(64, Math.max(1, Math.floor(Number(msg.step)) || 1)),
+            msg.region, // checked against the slice by clipRegion
+          );
+          break;
+        case 'prefetch':
+          // The viewer only hints when it has nothing newer to ask for, so this
+          // is idle time; at worst the whole of the page on screen, asked for
+          // once the controls rest, waits behind this one decode.
+          document.prefetch(Number(msg.index));
           break;
         case 'copy':
           void vscode.env.clipboard.writeText(String(msg.text ?? ''));

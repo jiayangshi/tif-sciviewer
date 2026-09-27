@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { BufferReader, ByteReader } from './tiff/decoder';
-import { SliceSource, SlicePayload } from './sliceSource';
+import { SliceSource, SlicePayload, PixelEncoding } from './sliceSource';
 import { PageMeta, StackMeta } from './tiff/types';
 import { SequenceSource, sequenceFromQuery, baseName } from './sequence';
 
@@ -113,7 +113,11 @@ export class TiffDocument implements vscode.CustomDocument {
   get stack(): StackMeta { return this.source.stack; }
   get pageCount(): number { return this.source.pageCount; }
 
-  slicePayload(index: number): SlicePayload { return this.source.payload(index); }
+  slicePayload(index: number, encoding: PixelEncoding = 'binary', step = 1, region?: unknown): SlicePayload {
+    return this.source.payload(index, encoding, step, region);
+  }
+
+  prefetch(index: number): boolean { return this.source.prefetch(index); }
 
   /** Per channel, a display window representative of the whole stack; undefined for one page. */
   stackWindows() { return this.source.stackWindows(); }
