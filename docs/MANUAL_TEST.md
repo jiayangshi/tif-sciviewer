@@ -166,6 +166,15 @@ On a Remote-SSH window:
 - [ ] A `.tif` on the remote box opens with no local copy of the file.
 - [ ] A large stack opens quickly — headers are read, not the whole file.
 - [ ] Scrubbing slices stays responsive over the link.
+- [ ] On a stack of 4096² slices, drag the slice slider across the stack and
+      let go: the image stops on the slice under the slider at once, rather
+      than playing through the slices it passed.
+- [ ] Hover while dragging through it: the readout shows `x, y` only; a moment
+      after the slider stops, the value appears.
+- [ ] Zoom to 100%, pan somewhere, and step with the arrow keys: stepping
+      stays quick, and after a pause the rest of the slice fills in around the
+      view if you pan.
+- [ ] Press Save PNG right after a step: the PNG is at full resolution.
 
 ## 9. Theme
 

@@ -4,6 +4,34 @@ All notable changes to this extension are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [semantic versioning](https://semver.org/).
 
+## [0.1.2] - 2026-09-27
+
+Third release.
+
+### Changed
+
+- **Browsing a stack of large slices keeps up.** On 4096x4096 float32 files a
+  step took over half a second, and a drag kept the image moving for seconds
+  after the hand stopped, because every slider position was decoded and sent in
+  turn. Measured in VS Code: a step now takes about 20 ms, and a drag lands on
+  the slice under the slider as soon as it stops.
+  - At most one slice is on its way at a time; when it lands, the viewer asks
+    for wherever the controls are by then and skips what they passed.
+  - Pixels travel to the webview as binary instead of an 85 MB base64 string,
+    falling back to base64 by itself on a transport that mangles binary.
+  - While the stack moves, only what the screen can show is sent - one sample
+    per device pixel of the part in view - and the whole slice follows once the
+    controls rest. The readout shows coordinates only where the preview does not
+    hold that exact pixel, and Save PNG waits for the whole slice.
+  - The host reads ahead one slice in the direction of travel when it would
+    otherwise be idle.
+  - The histogram pass is about 1.7x quicker, and LZW decoding about 3x.
+
+### Fixed
+
+- In a hyperstack, a slice that arrived after the channel slider had moved on
+  was given the range of the channel on the slider rather than its own.
+
 ## [0.1.1] - 2026-09-16
 
 Second release.

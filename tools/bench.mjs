@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const {
-  SliceSource, computeStats, autoAdjust, mapTo8Bit, composeRGBA, getLut, viewOf, fromBase64,
+  SliceSource, computeStats, autoAdjust, mapTo8Bit, composeRGBA, getLut, viewOf, payloadBytes,
 } = require('../dist/lib.cjs');
 const { FileByteReader } = require('./fileReader.cjs');
 
@@ -26,10 +26,18 @@ for (const file of process.argv.slice(2)) {
   console.log(`  statistics + histogram   ${tStats.toFixed(1)} ms`);
 
   const [tPayload, payload] = ms(() => src.payload(0));
-  console.log(`  base64 for the webview   ${tPayload.toFixed(1)} ms   (${mb(payload.base64.length)} MB on the wire)`);
+  console.log(`  payload for the webview  ${tPayload.toFixed(1)} ms   (${mb(payload.pixels.byteLength)} MB of binary)`);
 
-  const [tView, data] = ms(() => viewOf(fromBase64(payload.base64), payload.dtype, payload.littleEndian));
-  console.log(`  webview-side decode      ${tView.toFixed(1)} ms`);
+  const [tView, data] = ms(() => viewOf(payloadBytes(payload), payload.dtype, payload.littleEndian));
+  console.log(`  webview-side view        ${tView.toFixed(1)} ms`);
+
+  // What travels while the stack is moving at fit-to-window: one sample per
+  // device pixel. A 4096-pixel slice in a ~1000-pixel view is about step 4.
+  const step = Math.max(1, Math.floor(m.width / 1024));
+  if (step > 1) {
+    const [tPrev, prev] = ms(() => src.payload(0, 'binary', step));
+    console.log(`  preview at step ${step}        ${tPrev.toFixed(1)} ms   (${mb(prev.pixels.byteLength)} MB)`);
+  }
 
   const px = m.width * m.height;
   const idx = new Uint8Array(px), mask = new Uint8Array(px), rgba = new Uint8ClampedArray(px * 4);
@@ -43,7 +51,7 @@ for (const file of process.argv.slice(2)) {
 
   if (src.pageCount > 1) {
     const n = Math.min(10, src.pageCount);
-    const [tScrub] = ms(() => { for (let i = 0; i < n; i++) src.payload(i); });
+    const [tScrub] = ms(() => { for (let i = 0; i < n; i++) src.payload(i, 'binary', step); });
     console.log(`  scrub ${String(n).padStart(2)} slices          ${tScrub.toFixed(1)} ms   (${(tScrub / n).toFixed(1)} ms/slice)`);
   }
   const heap = process.memoryUsage();

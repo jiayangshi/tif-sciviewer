@@ -42,14 +42,9 @@ function countingFactory(counts = { opened: 0, closed: 0 }) {
 
 const plainFactory = (id) => new BufferReader(new Uint8Array(fs.readFileSync(id)));
 
-/**
- * Decode a wire payload. `Buffer.from(b64).buffer` is the shared pool, not just
- * these bytes, so it has to be copied before being viewed as float32 - both to
- * get the alignment and to avoid reading a neighbour's data.
- */
-function floatsOf(base64) {
-  const bytes = new Uint8Array(Buffer.from(base64, 'base64'));
-  return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+/** The float32 values a wire payload carries, however they were encoded. */
+function floatsOf(payload) {
+  return lib.viewOf(lib.payloadBytes(payload), 'float32', payload.littleEndian);
 }
 
 describe('sequence ordering', () => {
@@ -285,7 +280,7 @@ describe('SliceSource over a sequence', () => {
       assert.equal(payload.width, W);
       assert.equal(payload.height, H);
       assert.equal(payload.dtype, 'float32');
-      assert.equal(floatsOf(payload.base64)[probe], expectedValue(W, H, probe, n, COUNT));
+      assert.equal(floatsOf(payload)[probe], expectedValue(W, H, probe, n, COUNT));
     }
     source.dispose();
   });

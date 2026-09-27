@@ -105,13 +105,30 @@ export function computeStats(data: NumericArray, dtype: DType, channels = 1, cha
   }
 
   const histogram = new Int32Array(N_BINS);
-  for (let i = start; i < data.length; i += step) {
-    const v = data[i];
-    if (!Number.isFinite(v)) continue;
-    let idx = eightBit ? v - histMin : Math.floor(scale * (v - histMin));
-    if (idx >= N_BINS) idx = N_BINS - 1;
-    else if (idx < 0) idx = 0;
-    histogram[idx]++;
+  const n = data.length;
+  const last = N_BINS - 1;
+  // This pass runs over every pixel of every slice shown, so the common cases
+  // get loops with nothing in them that the data has already ruled out.
+  if (eightBit) {
+    // Integer arrays hold no NaN, and every 8-bit value has a bin of its own.
+    for (let i = start; i < n; i += step) histogram[data[i] - histMin]++;
+  } else if (nonFinite === 0 && Number.isFinite(scale)) {
+    // No NaN/Inf, so no finiteness test; and v >= histMin, so the argument is
+    // never negative and `| 0` truncates exactly as ImageJ's (int) cast does.
+    for (let i = start; i < n; i += step) {
+      let idx = (scale * (data[i] - histMin)) | 0;
+      if (idx > last) idx = last;
+      histogram[idx]++;
+    }
+  } else {
+    for (let i = start; i < n; i += step) {
+      const v = data[i];
+      if (!Number.isFinite(v)) continue;
+      let idx = Math.floor(scale * (v - histMin));
+      if (idx >= N_BINS) idx = last;
+      else if (idx < 0) idx = 0;
+      histogram[idx]++;
+    }
   }
 
   const mean = sum / count;

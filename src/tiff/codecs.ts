@@ -7,98 +7,71 @@ import * as zlib from 'zlib';
  * TIFF LZW (spec section 13). Differs from GIF LZW in two ways: codes are
  * packed MSB-first, and the code width increases one code *early*, which is the
  * classic source of off-by-one bugs here.
+ *
+ * Every dictionary entry past the 256 roots is the string of the code before
+ * it plus one byte - and that is exactly what was just written to the output,
+ * contiguously. So an entry is kept as where it starts in the output and how
+ * long it is, and emitting it is a forward copy, with no chain to walk. On a
+ * 4096x4096 float32 slice this is several times quicker than walking prefix
+ * chains, which is the difference between a stack that keeps up and one that
+ * does not.
  */
 export function lzwDecode(input: Uint8Array, expectedLength: number): Uint8Array {
   const out = new Uint8Array(expectedLength);
-  let outPos = 0;
-
-  // Dictionary as (prefix, suffix) pairs so we never allocate per-entry arrays.
   const MAX = 4096;
-  const prefix = new Int32Array(MAX);
-  const suffix = new Uint8Array(MAX);
-  const length = new Int32Array(MAX);
-  for (let i = 0; i < 256; i++) { prefix[i] = -1; suffix[i] = i; length[i] = 1; }
+  const start = new Int32Array(MAX);
+  const length = new Int32Array(MAX).fill(1, 0, 256);
 
+  const inLen = input.length;
+  let inPos = 0;
+  let bitBuf = 0;
+  let bitCount = 0;
+  let outPos = 0;
   let next = 258;
   let codeWidth = 9;
-  let bitPos = 0;
-  const totalBits = input.length * 8;
-  // Scratch big enough for the longest possible dictionary entry.
-  const scratch = new Uint8Array(MAX);
-
-  const readCode = (): number => {
-    if (bitPos + codeWidth > totalBits) return 257; // treat truncation as EOI
-    let code = 0;
-    for (let i = 0; i < codeWidth; i++) {
-      const byte = input[(bitPos + i) >> 3];
-      const bit = (byte >> (7 - ((bitPos + i) & 7))) & 1;
-      code = (code << 1) | bit;
-    }
-    bitPos += codeWidth;
-    return code;
-  };
-
-  const emit = (code: number): number => {
-    // Walk the prefix chain backwards into scratch, then copy forwards.
-    let n = 0;
-    let c = code;
-    while (c >= 0) { scratch[n++] = suffix[c]; c = prefix[c]; }
-    for (let i = n - 1; i >= 0; i--) {
-      if (outPos < expectedLength) out[outPos++] = scratch[i];
-    }
-    return scratch[n - 1]; // first byte of the entry
-  };
-
-  const reset = () => {
-    next = 258;
-    codeWidth = 9;
-  };
-
   let oldCode = -1;
-  for (;;) {
-    const code = readCode();
-    if (code === 257) break;            // EOI
-    if (code === 256) { reset(); oldCode = -1; continue; }
+  let oldPos = 0; // where oldCode's string was written
 
-    if (oldCode === -1) {
-      emit(code);
-      oldCode = code;
-    } else {
-      let firstByte: number;
-      if (code < next) {
-        firstByte = emit(code);
-      } else {
-        // KwKwK case: the code is the one we are about to define.
-        let c = oldCode;
-        while (prefix[c] >= 0) c = prefix[c];
-        firstByte = suffix[c];
-        // emit oldCode's string followed by its own first byte
-        emitEntryPlusByte(oldCode, firstByte);
-      }
-      if (next < MAX) {
-        prefix[next] = oldCode;
-        suffix[next] = firstByte;
-        length[next] = length[oldCode] + 1;
-        next++;
-      }
-      oldCode = code;
+  while (outPos < expectedLength) {
+    while (bitCount < codeWidth) {
+      if (inPos >= inLen) return out; // truncation reads as EOI
+      bitBuf = ((bitBuf << 8) | input[inPos++]) & 0xffffff;
+      bitCount += 8;
     }
+    bitCount -= codeWidth;
+    const code = (bitBuf >>> bitCount) & ((1 << codeWidth) - 1);
+
+    if (code === 257) break; // EOI
+    if (code === 256) { next = 258; codeWidth = 9; oldCode = -1; continue; }
+
+    const at = outPos;
+    if (code < 256) {
+      out[outPos++] = code;
+    } else if (code < next) {
+      const end = Math.min(outPos + length[code], expectedLength);
+      for (let s = start[code]; outPos < end;) out[outPos++] = out[s++];
+    } else if (oldCode >= 0) {
+      // KwKwK: the code is the one about to be defined - oldCode's string
+      // followed by its own first byte.
+      const end = Math.min(outPos + length[oldCode], expectedLength);
+      for (let s = oldPos; outPos < end;) out[outPos++] = out[s++];
+      if (outPos < expectedLength) out[outPos++] = out[oldPos];
+    } else {
+      break; // a code that names nothing: the stream is corrupt
+    }
+
+    if (oldCode >= 0 && next < MAX) {
+      // oldCode's string, then the first byte of this one: contiguous in the output.
+      start[next] = oldPos;
+      length[next] = length[oldCode] + 1;
+      next++;
+    }
+    oldCode = code;
+    oldPos = at;
     if (next + 1 === 512) codeWidth = 10;
     else if (next + 1 === 1024) codeWidth = 11;
     else if (next + 1 === 2048) codeWidth = 12;
-    if (outPos >= expectedLength) break;
   }
-
-  function emitEntryPlusByte(code: number, extra: number) {
-    let n = 0;
-    let c = code;
-    while (c >= 0) { scratch[n++] = suffix[c]; c = prefix[c]; }
-    for (let i = n - 1; i >= 0; i--) {
-      if (outPos < expectedLength) out[outPos++] = scratch[i];
-    }
-    if (outPos < expectedLength) out[outPos++] = extra;
-  }
-
   return out;
 }
 
@@ -140,38 +113,46 @@ export function inflateDecode(input: Uint8Array): Uint8Array {
 export function undoHorizontalPredictor(
   data: Uint8Array, width: number, height: number, samples: number, bitsPerSample: number, littleEndian: boolean,
 ): void {
+  const rowVals = width * samples;
   if (bitsPerSample === 8) {
-    const rowBytes = width * samples;
     for (let y = 0; y < height; y++) {
-      const base = y * rowBytes;
-      for (let x = samples; x < rowBytes; x++) data[base + x] = (data[base + x] + data[base + x - samples]) & 0xff;
+      const base = y * rowVals;
+      for (let x = samples; x < rowVals; x++) data[base + x] = (data[base + x] + data[base + x - samples]) & 0xff;
     }
-  } else if (bitsPerSample === 16) {
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const rowVals = width * samples;
+    return;
+  }
+  if (bitsPerSample !== 16 && bitsPerSample !== 32) {
+    throw new Error(`Predictor 2 is not defined for ${bitsPerSample}-bit samples`);
+  }
+  const bytes = bitsPerSample / 8;
+  // In host byte order a typed array does the arithmetic, and wraps on store.
+  if (littleEndian === HOST_LE && data.byteOffset % bytes === 0) {
+    const n = (data.byteLength / bytes) | 0;
+    const v = bytes === 2 ? new Uint16Array(data.buffer, data.byteOffset, n) : new Uint32Array(data.buffer, data.byteOffset, n);
     for (let y = 0; y < height; y++) {
-      const base = y * rowVals * 2;
-      for (let x = samples; x < rowVals; x++) {
+      const base = y * rowVals;
+      for (let x = samples; x < rowVals; x++) v[base + x] = v[base + x] + v[base + x - samples];
+    }
+    return;
+  }
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  for (let y = 0; y < height; y++) {
+    const base = y * rowVals * bytes;
+    for (let x = samples; x < rowVals; x++) {
+      if (bytes === 2) {
         const cur = view.getUint16(base + x * 2, littleEndian);
         const prev = view.getUint16(base + (x - samples) * 2, littleEndian);
         view.setUint16(base + x * 2, (cur + prev) & 0xffff, littleEndian);
-      }
-    }
-  } else if (bitsPerSample === 32) {
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const rowVals = width * samples;
-    for (let y = 0; y < height; y++) {
-      const base = y * rowVals * 4;
-      for (let x = samples; x < rowVals; x++) {
+      } else {
         const cur = view.getUint32(base + x * 4, littleEndian);
         const prev = view.getUint32(base + (x - samples) * 4, littleEndian);
         view.setUint32(base + x * 4, (cur + prev) >>> 0, littleEndian);
       }
     }
-  } else {
-    throw new Error(`Predictor 2 is not defined for ${bitsPerSample}-bit samples`);
   }
 }
+
+const HOST_LE = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 
 /**
  * Predictor 3: floating-point predictor. Bytes are stored de-interleaved
@@ -183,18 +164,29 @@ export function undoFloatingPointPredictor(
   data: Uint8Array, width: number, height: number, samples: number, bitsPerSample: number, littleEndian: boolean,
 ): void {
   const bytesPerSample = bitsPerSample / 8;
-  const rowBytes = width * samples * bytesPerSample;
+  const count = width * samples;
+  const rowBytes = count * bytesPerSample;
   const tmp = new Uint8Array(rowBytes);
   for (let y = 0; y < height; y++) {
     const base = y * rowBytes;
-    for (let i = 1; i < rowBytes; i++) data[base + i] = (data[base + i] + data[base + i - 1]) & 0xff;
-    const count = width * samples;
-    for (let i = 0; i < count; i++) {
-      for (let b = 0; b < bytesPerSample; b++) {
-        // Plane b holds byte b (most significant first) of every sample.
-        const src = data[base + b * count + i];
-        const dstByte = littleEndian ? bytesPerSample - 1 - b : b;
-        tmp[i * bytesPerSample + dstByte] = src;
+    let acc = data[base];
+    for (let i = 1; i < rowBytes; i++) { acc = (acc + data[base + i]) & 0xff; data[base + i] = acc; }
+    // Plane b holds byte b (most significant first) of every sample; the
+    // common widths are unrolled, which this per-row loop spends most of its time on.
+    const p = base;
+    if (bytesPerSample === 4) {
+      const [a, b, c, d] = littleEndian ? [3, 2, 1, 0] : [0, 1, 2, 3];
+      for (let i = 0, o = 0; i < count; i++, o += 4) {
+        tmp[o + a] = data[p + i];
+        tmp[o + b] = data[p + count + i];
+        tmp[o + c] = data[p + 2 * count + i];
+        tmp[o + d] = data[p + 3 * count + i];
+      }
+    } else {
+      for (let i = 0; i < count; i++) {
+        for (let k = 0; k < bytesPerSample; k++) {
+          tmp[i * bytesPerSample + (littleEndian ? bytesPerSample - 1 - k : k)] = data[p + k * count + i];
+        }
       }
     }
     data.set(tmp, base);

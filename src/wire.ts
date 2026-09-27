@@ -21,17 +21,82 @@ export interface SlicePayload {
   samplesPerPixel: number;
   dtype: DType;
   /**
-   * Pixel bytes as base64.
+   * Pixel bytes, as they sit in memory.
    *
-   * Structured clone of an ArrayBuffer is not dependable across every
-   * extension-host/webview transport VS Code uses - notably Remote-SSH and
-   * vscode.dev, which are exactly the setups this extension exists for. Base64
-   * costs 33% bandwidth and one decode pass, and always survives the trip.
+   * For an extension whose `engines.vscode` is 1.57 or later, VS Code lifts
+   * typed arrays out of a webview message and ships them alongside the JSON as
+   * binary, over every transport it runs the extension host behind - local,
+   * Remote-SSH, tunnels. Base64 in a JSON string was used before this, and for
+   * a 4096x4096 float32 slice it came to an 85 MB string built, stringified,
+   * parsed and decoded char by char on every step through a stack: most of
+   * half a second, against a few milliseconds for the bytes themselves.
+   *
+   * It must be a plain Uint8Array over a buffer of exactly its own length:
+   * VS Code recognises views by constructor name, so a Node Buffer would fall
+   * through to JSON, and it sends the whole underlying ArrayBuffer.
    */
-  base64: string;
+  pixels?: Uint8Array;
+  /** The same bytes as base64, sent only to a webview that saw `pixels` arrive broken. */
+  base64?: string;
+  /**
+   * 1 when every pixel is here. Otherwise the pixels are a preview holding
+   * every step-th pixel each way (see sampledSize), while width, height and
+   * stats still describe the whole slice.
+   */
+  step: number;
+  /** Set when the pixels cover only this part of the slice; absent for all of it. */
+  region?: Region;
   /** Byte order of the payload, so the webview can view or swap as needed. */
   littleEndian: boolean;
   stats: SerializableStats;
+}
+
+/** A rectangle of a slice, in the slice's own pixels. */
+export interface Region {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * A requested region cut to a width x height slice, on whole pixels. Undefined
+ * when that leaves nothing, or leaves the whole slice: either way, all of it.
+ */
+export function clipRegion(r: unknown, width: number, height: number): Region | undefined {
+  if (!r || typeof r !== 'object') return undefined;
+  const q = r as Record<string, unknown>;
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : NaN);
+  const x0 = Math.max(0, Math.floor(num(q.x)));
+  const y0 = Math.max(0, Math.floor(num(q.y)));
+  const x1 = Math.min(width, Math.ceil(num(q.x) + num(q.width)));
+  const y1 = Math.min(height, Math.ceil(num(q.y) + num(q.height)));
+  if (!(x1 > x0 && y1 > y0)) return undefined;
+  if (x0 === 0 && y0 === 0 && x1 === width && y1 === height) return undefined;
+  return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+}
+
+/** Dimensions of a slice sampled at every `step`-th pixel in each direction. */
+export function sampledSize(width: number, height: number, step: number): { width: number; height: number } {
+  return { width: Math.ceil(width / step), height: Math.ceil(height / step) };
+}
+
+/** How a slice's pixels travel: see SlicePayload.pixels. */
+export type PixelEncoding = 'binary' | 'base64';
+
+/**
+ * The bytes a payload carries, whichever way they came. Undefined when they did
+ * not survive the trip, which is the webview's cue to ask for base64 instead.
+ * `ArrayBuffer.isView` rather than `instanceof`, which a view made in another
+ * realm fails.
+ */
+export function payloadBytes(p: { pixels?: unknown; base64?: unknown }): Uint8Array | undefined {
+  const px = p.pixels;
+  if (px !== undefined && px !== null && ArrayBuffer.isView(px)) {
+    return new Uint8Array(px.buffer, px.byteOffset, px.byteLength);
+  }
+  if (typeof p.base64 === 'string') return fromBase64(p.base64);
+  return undefined;
 }
 
 export function isLittleEndianHost(): boolean {

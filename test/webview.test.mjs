@@ -13,7 +13,8 @@ const require = createRequire(import.meta.url);
 const lib = require('../dist/lib.cjs');
 const {
   SliceSource, BufferReader, bodyHtml, computeStats, autoAdjust, stretchHistogram,
-  resetRange, getLut, mapTo8Bit, composeRGBA, viewOf, fromBase64, SequenceSource,
+  resetRange, getLut, mapTo8Bit, composeRGBA, viewOf, payloadBytes, SequenceSource,
+  subsample, sampledSize,
 } = lib;
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -43,7 +44,11 @@ function stubContext(canvas) {
   return ctx;
 }
 
-function mount() {
+/**
+ * `timers: 'manual'` queues setTimeout callbacks for the test to run with
+ * h.runTimers(), so waiting for the viewer to settle takes no real time.
+ */
+function mount({ timers = 'real' } = {}) {
   const dom = new JSDOM(`<!DOCTYPE html><html><body>${bodyHtml()}</body></html>`, {
     pretendToBeVisual: true,
     runScripts: 'outside-only',
@@ -80,6 +85,21 @@ function mount() {
   // Run callbacks synchronously so tests need no timers.
   window.requestAnimationFrame = cb => { cb(0); return 0; };
 
+  const pendingTimers = new Map();
+  let timerId = 0;
+  if (timers === 'manual') {
+    window.setTimeout = (fn, ms) => { pendingTimers.set(++timerId, { fn, ms }); return timerId; };
+    window.clearTimeout = id => { pendingTimers.delete(id); };
+  }
+  /** Run every timer due within `ms`, including any they set in turn. */
+  const runTimers = (ms = Infinity) => {
+    for (let guard = 0; guard < 100; guard++) {
+      const due = [...pendingTimers].filter(([, t]) => t.ms <= ms);
+      if (!due.length) return;
+      for (const [id, t] of due) { pendingTimers.delete(id); t.fn(); }
+    }
+  };
+
   window.eval(VIEWER_JS);
 
   const send = msg => {
@@ -88,6 +108,9 @@ function mount() {
   };
   const $ = id => window.document.getElementById(id);
   const canvasCtx = () => contexts.get(window.document.getElementById('canvas'));
+  /** Every offscreen drawing surface the viewer has made, oldest first. */
+  const surfaces = () => [...contexts].filter(([el]) => el !== window.document.getElementById('canvas')
+    && el !== window.document.getElementById('histogram')).map(([, ctx]) => ctx);
   const offscreenCtx = () => {
     for (const [el, ctx] of contexts) {
       if (el !== window.document.getElementById('canvas')
@@ -95,7 +118,7 @@ function mount() {
     }
     return null;
   };
-  return { window, posted, send, $, canvasCtx, offscreenCtx };
+  return { window, posted, send, $, canvasCtx, offscreenCtx, surfaces, runTimers, pendingTimers };
 }
 
 function payloadFor(file, index = 0) {
@@ -128,13 +151,30 @@ function initMessage(src, fileName, overrides = {}) {
 function reference(file, range, lutName = 'Grays', index = 0) {
   const src = new SliceSource(new BufferReader(new Uint8Array(fs.readFileSync(file))));
   const p = src.payload(index);
-  const data = viewOf(fromBase64(p.base64), p.dtype, p.littleEndian);
+  const data = viewOf(payloadBytes(p), p.dtype, p.littleEndian);
   const idx = new Uint8Array(p.width * p.height);
   const mask = new Uint8Array(p.width * p.height);
   mapTo8Bit(data, range.min, range.max, idx, { mask });
   const rgba = new Uint8ClampedArray(p.width * p.height * 4);
   composeRGBA(idx, getLut(lutName), rgba, mask, [255, 64, 64]);
   return { rgba, stats: computeStats(data, p.dtype, p.samplesPerPixel), payload: p, data };
+}
+
+/**
+ * Play the host: answer every slice request the viewer has made, in order, with
+ * that page's payload - as the extension does - until it stops asking. The
+ * viewer keeps one request out at a time, so this is what moves it along.
+ * Returns the pages asked for.
+ */
+function serve(h, src) {
+  const asked = [];
+  for (h.served ??= 0; h.served < h.posted.length; h.served++) {
+    const m = h.posted[h.served];
+    if (m.type !== 'requestSlice') continue;
+    asked.push(Number(m.index));
+    h.send(src.payload(Number(m.index), m.encoding, m.step, m.region));
+  }
+  return asked;
 }
 
 /**
@@ -161,7 +201,7 @@ describe('webview end to end', () => {
     h.send(payload);
 
     const stats = computeStats(
-      viewOf(fromBase64(payload.base64), payload.dtype, payload.littleEndian),
+      viewOf(payloadBytes(payload), payload.dtype, payload.littleEndian),
       payload.dtype, payload.samplesPerPixel,
     );
     const expectedRange = autoAdjust(stats, 0).range;
@@ -184,7 +224,7 @@ describe('webview end to end', () => {
     h.send(payload);
 
     const stats = computeStats(
-      viewOf(fromBase64(payload.base64), payload.dtype, payload.littleEndian), payload.dtype,
+      viewOf(payloadBytes(payload), payload.dtype, payload.littleEndian), payload.dtype,
     );
     const expected = autoAdjust(stats, 0).range;
     assert.ok(Math.abs(Number(h.$('input-min').value) - expected.min) < 1e-3, h.$('input-min').value);
@@ -237,7 +277,7 @@ describe('webview end to end', () => {
     h.send(payload);
     h.$('btn-enhance').click();
     const stats = computeStats(
-      viewOf(fromBase64(payload.base64), payload.dtype, payload.littleEndian), payload.dtype,
+      viewOf(payloadBytes(payload), payload.dtype, payload.littleEndian), payload.dtype,
     );
     const expected = stretchHistogram(stats, 0.35);
     assert.ok(Math.abs(Number(h.$('input-min').value) - expected.min) < 1e-3);
@@ -289,7 +329,7 @@ describe('webview end to end', () => {
     h.$('select-lut').dispatchEvent(new h.window.Event('change'));
 
     const stats = computeStats(
-      viewOf(fromBase64(payload.base64), payload.dtype, payload.littleEndian), payload.dtype,
+      viewOf(payloadBytes(payload), payload.dtype, payload.littleEndian), payload.dtype,
     );
     const ref = reference(CT, autoAdjust(stats, 0).range, 'Fire');
     const drawn = h.offscreenCtx()._lastImageData;
@@ -389,8 +429,8 @@ describe('webview end to end', () => {
     // Must not run off the start of the stack.
     h.window.document.dispatchEvent(new h.window.KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
     h.window.document.dispatchEvent(new h.window.KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
-    const idx = h.posted.filter(m => m.type === 'requestSlice').map(m => Number(m.index));
-    assert.deepEqual(idx, [1, 0]);
+    assert.deepEqual(serve(h, src), [1, 0]);
+    assert.match(h.$('slice-label').textContent, /z 1\/7/);
   });
 
   test('keyboard shortcuts drive contrast', () => {
@@ -509,13 +549,14 @@ describe('webview end to end', () => {
     h.send(initMessage(src, 'imagej_hyperstack.tif'));
     h.send(payload);
 
+    // The viewer ends up asking for the page the controls point at, however
+    // many it skipped on the way.
     const requestFor = (c, z, t) => {
-      h.posted.length = 0;
       h.$('slider-c').value = String(c); h.$('slider-c').dispatchEvent(new h.window.Event('input'));
       h.$('slider-slice').value = String(z); h.$('slider-slice').dispatchEvent(new h.window.Event('input'));
       h.$('slider-t').value = String(t); h.$('slider-t').dispatchEvent(new h.window.Event('input'));
-      const reqs = h.posted.filter(m => m.type === 'requestSlice');
-      return reqs.length ? Number(reqs[reqs.length - 1].index) : null;
+      const asked = serve(h, src);
+      return asked.length ? asked[asked.length - 1] : null;
     };
     // page = t*channels*slices + z*channels + c
     assert.equal(requestFor(1, 0, 0), 1);
@@ -570,6 +611,324 @@ describe('webview end to end', () => {
   });
 });
 
+describe('keeping up with a moving stack', () => {
+  const requests = h => h.posted.filter(m => m.type === 'requestSlice').map(m => Number(m.index));
+  const slide = (h, id, v) => { h.$(id).value = String(v); h.$(id).dispatchEvent(new h.window.Event('input')); };
+  const openStack = () => {
+    const h = mount();
+    const { src, payload } = payloadFor(STACK);
+    h.send(initMessage(src, 'stack_f32.tif'));
+    h.send(payload);
+    return { h, src };
+  };
+
+  test('a drag keeps one request out and lands where the slider stopped', () => {
+    const { h, src } = openStack();
+    for (let v = 1; v <= 6; v++) slide(h, 'slider-slice', v);
+    assert.deepEqual(requests(h), [1], 'one request while the first is unanswered');
+    assert.match(h.$('slice-label').textContent, /z 7\/7/, 'the label follows the slider at once');
+
+    assert.deepEqual(serve(h, src), [1, 6], 'then straight to the slider, skipping what it passed');
+    const ref = reference(STACK, { min: Number(h.$('input-min').value), max: Number(h.$('input-max').value) }, 'Grays', 6);
+    const drawn = h.offscreenCtx()._lastImageData;
+    for (let i = 0; i < ref.rgba.length; i += 883) assert.equal(drawn.data[i], ref.rgba[i], `byte ${i}`);
+  });
+
+  test('the next page is asked for before the one that arrived is drawn', () => {
+    const { h, src } = openStack();
+    slide(h, 'slider-slice', 1);
+    slide(h, 'slider-slice', 3);
+    const ctx = h.offscreenCtx();
+    const put = ctx.putImageData;
+    let askedAtDraw;
+    ctx.putImageData = function (img) { askedAtDraw ??= requests(h); return put.call(this, img); };
+    h.send(src.payload(1));
+    assert.deepEqual(askedAtDraw, [1, 3], 'so the host decodes page 3 while page 1 is drawn');
+  });
+
+  test('an error for the page on its way does not stall the stack', () => {
+    const { h } = openStack();
+    slide(h, 'slider-slice', 1);
+    slide(h, 'slider-slice', 3);
+    h.send({ type: 'error', message: 'slice 2 is damaged', fatal: false, index: 1 });
+    assert.equal(h.$('overlay-error').hidden, false, 'the error is shown');
+    assert.deepEqual(requests(h), [1, 3], 'and the viewer moves on to where the slider is');
+
+    // A page that fails where the controls are is not asked for again and again.
+    h.send({ type: 'error', message: 'slice 4 is damaged', fatal: false, index: 3 });
+    assert.deepEqual(requests(h), [1, 3]);
+    slide(h, 'slider-slice', 5);
+    assert.deepEqual(requests(h), [1, 3, 5], 'moving on still works');
+  });
+
+  test('pixels that do not survive the transport switch it to base64', () => {
+    const h = mount();
+    const { src } = payloadFor(STACK);
+    h.send(initMessage(src, 'stack_f32.tif'));
+    // What a typed array turns into when a transport JSON-encodes it.
+    h.send({ ...src.payload(0), pixels: { 0: 12, 1: 34 } });
+    assert.deepEqual(plain(h.posted.filter(m => m.type === 'requestSlice')),
+      [{ type: 'requestSlice', index: 0, encoding: 'base64' }]);
+    serve(h, src);
+    const ref = reference(STACK, { min: Number(h.$('input-min').value), max: Number(h.$('input-max').value) });
+    const drawn = h.offscreenCtx()._lastImageData;
+    for (let i = 0; i < ref.rgba.length; i += 883) assert.equal(drawn.data[i], ref.rgba[i], `byte ${i}`);
+
+    slide(h, 'slider-slice', 2);
+    assert.deepEqual(plain(h.posted.filter(m => m.type === 'requestSlice').at(-1)),
+      { type: 'requestSlice', index: 2, encoding: 'base64' }, 'and it stays on base64');
+  });
+
+  test('with nothing newer to ask for, the host is told where the stack is heading', () => {
+    const { h, src } = openStack();
+    const hints = () => h.posted.filter(m => m.type === 'prefetch').map(m => Number(m.index));
+    slide(h, 'slider-slice', 1);
+    serve(h, src);
+    assert.deepEqual(hints(), [2], 'one step on, in the direction of travel');
+    slide(h, 'slider-slice', 4);
+    serve(h, src);
+    assert.deepEqual(hints(), [2], 'a stride of 3 from 4 runs off the end, so no hint');
+    slide(h, 'slider-slice', 2);
+    serve(h, src);
+    assert.deepEqual(hints(), [2, 0], 'and the stride is kept, backwards too');
+  });
+
+  test('no read-ahead while a drag has somewhere newer to go', () => {
+    const { h, src } = openStack();
+    for (let v = 1; v <= 5; v++) slide(h, 'slider-slice', v);
+    h.send(src.payload(1)); // the slider is at 5 by now
+    assert.equal(h.posted.some(m => m.type === 'prefetch'), false, 'it would only hold up page 5');
+    assert.deepEqual(requests(h), [1, 5]);
+  });
+
+  test('read-ahead follows the axis that moved in a hyperstack', () => {
+    const h = mount();
+    const { src, payload } = payloadFor(path.join(FIX, 'imagej_hyperstack.tif'));
+    h.send(initMessage(src, 'imagej_hyperstack.tif'));
+    h.send(payload);
+    slide(h, 'slider-slice', 1); // z steps a whole channel group at a time
+    serve(h, src);
+    assert.deepEqual(h.posted.filter(m => m.type === 'prefetch').map(m => Number(m.index)), [4]);
+  });
+
+  test('a late reply for a channel the controls have left keeps its own range', () => {
+    const h = mount();
+    const { src, payload } = payloadFor(path.join(FIX, 'imagej_hyperstack.tif'));
+    h.send(initMessage(src, 'imagej_hyperstack.tif'));
+    h.send(payload);
+    const c0 = Number(h.$('input-max').value);
+
+    // Over to channel 1 and straight back, before channel 1's page has landed.
+    slide(h, 'slider-c', 1);
+    slide(h, 'slider-c', 0);
+    h.send(src.payload(1));
+    const c1 = Number(h.$('input-max').value);
+    assert.ok(c1 > c0 * 5, `page 1 is channel 1 and must get channel 1's range: ${c0} vs ${c1}`);
+
+    assert.deepEqual(requests(h), [1, 0]);
+    h.send(src.payload(0));
+    assert.ok(Math.abs(Number(h.$('input-max').value) - c0) < 1e-6,
+      `channel 0 keeps its own range: ${h.$('input-max').value} vs ${c0}`);
+  });
+});
+
+describe('previews while moving through a large stack', () => {
+  // 8 MB a slice, the smallest that previews. The jsdom stage is 600x400 at a
+  // device pixel ratio of 1, so fit-to-window leaves one device pixel per three.
+  const PW = 2048, PH = 1024, N = 3;
+  const STEP = Math.floor(1 / ((600 - 16) / PW));
+  let dir, seq, src;
+
+  before(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tif-preview-'));
+    const paths = [];
+    for (let n = 0; n < N; n++) {
+      const pixels = new Float32Array(PW * PH);
+      for (let i = 0; i < pixels.length; i++) pixels[i] = ((i % PW) + Math.floor(i / PW) * 3 + n * 50) % 997;
+      paths.push(writeSliceTif(path.join(dir, `s_${n}.tif`), { width: PW, height: PH, pixels }));
+    }
+    seq = new SequenceSource(paths, id => new BufferReader(new Uint8Array(fs.readFileSync(id))));
+    src = new SliceSource(seq, 64 * 1024 * 1024, 512 * 1024 * 1024);
+  });
+  after(() => { src.dispose(); fs.rmSync(dir, { recursive: true, force: true }); });
+
+  const open = () => {
+    const h = mount({ timers: 'manual' });
+    h.send({ ...initMessage(src, 'big  (3 files)'), sequence: { count: N, labels: seq.sliceLabels() } });
+    h.send(src.payload(0));
+    return h;
+  };
+  const move = (h, v) => {
+    h.$('slider-slice').value = String(v);
+    h.$('slider-slice').dispatchEvent(new h.window.Event('input'));
+  };
+  const lastRequest = h => plain(h.posted.filter(m => m.type === 'requestSlice').at(-1));
+  const surfaceOf = (h, w) => h.surfaces().find(c => c.canvas.width === w);
+  const rangeNow = h => ({ min: Number(h.$('input-min').value), max: Number(h.$('input-max').value) });
+  const rgbaOf = (data, range) => {
+    const idx = new Uint8Array(data.length);
+    mapTo8Bit(data, range.min, range.max, idx, {});
+    const rgba = new Uint8ClampedArray(data.length * 4);
+    composeRGBA(idx, getLut('Grays'), rgba);
+    return rgba;
+  };
+
+  test('the first slice arrives whole, and moving asks for a preview', () => {
+    const h = open();
+    assert.ok(surfaceOf(h, PW), 'the opening slice is drawn at full resolution');
+    move(h, 1);
+    assert.deepEqual(lastRequest(h), { type: 'requestSlice', index: 1, step: STEP });
+  });
+
+  test('the preview is drawn from measured pixels, scaled back up to the slice', () => {
+    const h = open();
+    move(h, 1);
+    serve(h, src);
+    const size = sampledSize(PW, PH, STEP);
+    const ctx = surfaceOf(h, size.width);
+    assert.ok(ctx, 'a surface at the preview size');
+    const want = rgbaOf(subsample(src.getSlice(1).data, PW, PH, 1, STEP), rangeNow(h));
+    const drawn = ctx._lastImageData.data;
+    assert.equal(drawn.length, want.length);
+    for (let i = 0; i < want.length; i += 331) assert.equal(drawn[i], want[i], `byte ${i}`);
+
+    // Scaled so it covers the slice exactly as the full image would.
+    const call = h.canvasCtx()._drawImageCalls.at(-1);
+    assert.equal(call[0], ctx.canvas);
+    const zoom = (600 - 16) / PW;
+    assert.ok(Math.abs(call[7] - size.width * STEP * zoom) < 1e-9, `drawn ${call[7]} wide`);
+    assert.ok(Math.abs(call[7] - PW * zoom) < STEP * zoom, 'within one block of the slice width');
+  });
+
+  test('statistics on screen are the whole slice, not the preview', () => {
+    const h = open();
+    move(h, 1);
+    serve(h, src);
+    assert.match(h.$('stats').textContent, new RegExp((PW * PH).toLocaleString()));
+    const whole = computeStats(src.getSlice(1).data, 'float32');
+    assert.ok(Math.abs(Number(h.$('hist-hi').textContent) - whole.histMax) < 1e-3);
+  });
+
+  test('once the controls settle, the whole slice replaces the preview', () => {
+    const h = open();
+    move(h, 1);
+    serve(h, src);
+    assert.deepEqual(lastRequest(h), { type: 'requestSlice', index: 1, step: STEP }, 'nothing more yet');
+    h.runTimers();
+    assert.deepEqual(lastRequest(h), { type: 'requestSlice', index: 1 }, 'the whole of page 1');
+    serve(h, src);
+
+    const full = surfaceOf(h, PW);
+    const want = rgbaOf(src.getSlice(1).data, rangeNow(h));
+    for (let i = 0; i < want.length; i += 4099) assert.equal(full._lastImageData.data[i], want[i], `byte ${i}`);
+    assert.equal(h.canvasCtx()._drawImageCalls.at(-1)[0], full.canvas);
+    assert.equal(h.pendingTimers.size, 0, 'and nothing else is scheduled');
+  });
+
+  test('moving on before the pause is up postpones the swap', () => {
+    const h = open();
+    move(h, 1);
+    serve(h, src);
+    move(h, 2);
+    serve(h, src);
+    h.runTimers();
+    const asked = h.posted.filter(m => m.type === 'requestSlice').map(m => [m.index, m.step ?? 1]);
+    assert.deepEqual(asked, [[1, STEP], [2, STEP], [2, 1]], 'page 1 is never fetched whole');
+  });
+
+  test('the readout waits for real values while a preview is shown', () => {
+    const h = open();
+    move(h, 1);
+    serve(h, src);
+    const ev = new h.window.MouseEvent('pointermove', { bubbles: true });
+    Object.defineProperty(ev, 'offsetX', { value: 300 });
+    Object.defineProperty(ev, 'offsetY', { value: 200 });
+    h.$('canvas').dispatchEvent(ev);
+    assert.match(h.$('pos').textContent, /^x=\d+, y=\d+$/, 'coordinates, but no value from another pixel');
+
+    h.runTimers();
+    serve(h, src);
+    const m = /^x=(\d+), y=(\d+), value=(.+)$/.exec(h.$('pos').textContent);
+    assert.ok(m, `the value appears with the whole slice: ${h.$('pos').textContent}`);
+    const want = src.getSlice(1).data[Number(m[2]) * PW + Number(m[1])];
+    assert.equal(Number(m[3]), want);
+  });
+
+  test('zoomed in, only the part in view travels, at every pixel', () => {
+    const h = open();
+    h.window.document.dispatchEvent(new h.window.KeyboardEvent('keydown', { key: '1', bubbles: true }));
+    move(h, 1);
+    const req = lastRequest(h);
+    assert.equal(req.step, undefined, 'one device pixel per slice pixel: nothing to thin');
+    const r = req.region;
+    assert.ok(r, 'but a region');
+    // It covers the 600x400 view with room to spare, and far less than the slice.
+    const offX = (600 - PW) / 2, offY = (400 - PH) / 2;
+    assert.ok(r.x <= -offX && r.y <= -offY, `starts before the view: ${JSON.stringify(r)}`);
+    assert.ok(r.x + r.width >= 600 - offX && r.y + r.height >= 400 - offY, 'ends after it');
+    assert.ok(r.width * r.height < PW * PH / 4, `and is a fraction of the slice: ${r.width}x${r.height}`);
+
+    serve(h, src);
+    const ctx = surfaceOf(h, r.width);
+    const crop = subsample(src.getSlice(1).data, PW, PH, 1, 1, r);
+    const want = rgbaOf(crop, rangeNow(h));
+    for (let i = 0; i < want.length; i += 211) assert.equal(ctx._lastImageData.data[i], want[i], `byte ${i}`);
+    const call = h.canvasCtx()._drawImageCalls.at(-1);
+    assert.equal(call[0], ctx.canvas);
+    assert.equal(call[5], Math.round(offX + r.x), 'placed where its region sits');
+    assert.equal(call[6], Math.round(offY + r.y));
+    assert.equal(call[7], r.width, 'at 100%');
+  });
+
+  test('inside a cropped preview the readout has real values', () => {
+    const h = open();
+    h.window.document.dispatchEvent(new h.window.KeyboardEvent('keydown', { key: '1', bubbles: true }));
+    move(h, 1);
+    serve(h, src);
+    const ev = new h.window.MouseEvent('pointermove', { bubbles: true });
+    Object.defineProperty(ev, 'offsetX', { value: 250 });
+    Object.defineProperty(ev, 'offsetY', { value: 150 });
+    h.$('canvas').dispatchEvent(ev);
+    const m = /^x=(\d+), y=(\d+), value=(.+)$/.exec(h.$('pos').textContent);
+    assert.ok(m, h.$('pos').textContent);
+    assert.equal(Number(m[3]), src.getSlice(1).data[Number(m[2]) * PW + Number(m[1])]);
+
+    h.runTimers();
+    assert.deepEqual(lastRequest(h), { type: 'requestSlice', index: 1 }, 'the whole slice still follows');
+  });
+
+  test('Save PNG on a preview waits for the whole slice', () => {
+    const h = open();
+    move(h, 1);
+    serve(h, src);
+    const encoded = [];
+    const toDataURL = h.window.HTMLCanvasElement.prototype.toDataURL;
+    h.window.HTMLCanvasElement.prototype.toDataURL = function () { encoded.push(this.width); return toDataURL.call(this); };
+
+    h.$('btn-save').click();
+    assert.equal(h.posted.some(m => m.type === 'savePng'), false, 'never the preview');
+    assert.deepEqual(lastRequest(h), { type: 'requestSlice', index: 1 }, 'the whole slice is asked for at once');
+    serve(h, src);
+    const saves = h.posted.filter(m => m.type === 'savePng');
+    assert.equal(saves.length, 1);
+    assert.equal(Number(saves[0].sliceIndex), 1);
+    assert.deepEqual(encoded, [PW], 'encoded from the full-resolution surface');
+  });
+
+  test('a save left waiting is dropped when the stack moves on', () => {
+    const h = open();
+    move(h, 1);
+    serve(h, src);
+    h.$('btn-save').click();
+    move(h, 2);
+    serve(h, src);
+    h.runTimers();
+    serve(h, src);
+    assert.equal(h.posted.some(m => m.type === 'savePng'), false,
+      'the save was for page 1, which is no longer on screen');
+  });
+});
+
 describe('a stack built from separate files', () => {
   const COUNT = 5, SW = 40, SH = 24;
   let dir, paths, seq, src, labels;
@@ -590,7 +949,7 @@ describe('a stack built from separate files', () => {
 
   /** The reference pipeline, for a payload that came from a sequence. */
   const expectedRgba = (payload, range) => {
-    const data = viewOf(fromBase64(payload.base64), payload.dtype, payload.littleEndian);
+    const data = viewOf(payloadBytes(payload), payload.dtype, payload.littleEndian);
     const idx = new Uint8Array(payload.width * payload.height);
     const mask = new Uint8Array(payload.width * payload.height);
     mapTo8Bit(data, range.min, range.max, idx, { mask });
@@ -662,7 +1021,7 @@ describe('a stack built from separate files', () => {
       const payload = src.payload(n);
       h.send(payload);
       // Worked out again from the pixels themselves, not from the payload's stats.
-      const data = viewOf(fromBase64(payload.base64), payload.dtype, payload.littleEndian);
+      const data = viewOf(payloadBytes(payload), payload.dtype, payload.littleEndian);
       const want = barsFor(computeStats(data, payload.dtype).histogram);
       const bars = histCtx._fillRects.slice(0, 256).map(r => r[3]);
       bars.forEach((b, i) => assert.ok(Math.abs(b - want[i]) < 1e-9, `slice ${n + 1}, bin ${i}`));

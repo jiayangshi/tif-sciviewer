@@ -7,7 +7,7 @@ import { autoAdjust, stretchHistogram, resetRange, fromBrightnessContrast, toBri
 import { getLut, LUT_NAMES } from '../imagej/luts';
 import { mapTo8Bit, composeRGBA, renderColor, formatValue } from '../imagej/render';
 import { DType, NumericArray } from '../tiff/types';
-import { fromBase64, viewOf, SlicePayload } from '../wire';
+import { payloadBytes, viewOf, SlicePayload, PixelEncoding, Region, sampledSize, elementSize } from '../wire';
 
 declare function acquireVsCodeApi(): {
   postMessage(msg: unknown): void;
@@ -52,11 +52,46 @@ interface InitMessage {
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
+/**
+ * Slices at least this big travel as previews while the stack is moving; below
+ * it the whole slice is cheap enough to send every time.
+ */
+const PREVIEW_MIN_BYTES = 8 * 1024 * 1024;
+/** Coarsest preview; past this the saving no longer matters. */
+const MAX_PREVIEW_STEP = 16;
+/** How long the stack controls stay still before a preview is replaced by the whole slice. */
+const SETTLE_MS = 200;
+
+/** One resolution's worth of drawing buffers. */
+interface Surface {
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+  image: ImageData;
+  indices: Uint8Array;
+  mask: Uint8Array;
+}
+
 class Viewer {
   private init?: InitMessage;
   private data?: NumericArray;
   private stats?: Stats;
-  private sliceIndex = 0;
+  /** The page on screen; -1 until the first one lands. */
+  private sliceIndex = -1;
+  /** The page the stack controls point at, which the viewer is working towards. */
+  private wantedIndex = 0;
+  /** The page asked of the host and not yet answered. */
+  private inFlight: number | undefined;
+  private encoding: PixelEncoding = 'binary';
+  /** 1 when the data on screen has every pixel; otherwise the preview's sampling step. */
+  private shownStep = 1;
+  /** The part of the slice the data on screen covers; undefined for all of it. */
+  private shownRegion: Region | undefined;
+  private upgradeTimer: ReturnType<typeof setTimeout> | undefined;
+  /** A Save PNG waiting for the whole of this page to replace its preview. */
+  private pendingSave: number | undefined;
+  private lastPointer: { x: number; y: number } | undefined;
+  /** Page stride of the last move through the stack, to guess the next page by. */
+  private lastStride = 0;
   private width = 0;
   private height = 0;
   private samplesPerPixel = 1;
@@ -89,12 +124,14 @@ class Viewer {
   private offsetY = 0;
   private userHasZoomed = false;
 
-  /** Offscreen image at native resolution; the canvas only scales it. */
-  private offscreen = document.createElement('canvas');
-  private offCtx = this.offscreen.getContext('2d', { willReadFrequently: false })!;
-  private indices = new Uint8Array(0);
-  private nanMask = new Uint8Array(0);
-  private imageData?: ImageData;
+  /**
+   * Offscreen image at the data's own resolution; the canvas only scales it.
+   * A preview and the whole slice alternate at every pause in a stack, so a
+   * surface is kept for each rather than rebuilt at every swap.
+   */
+  private fullSurface?: Surface;
+  private previewSurface?: Surface;
+  private surface?: Surface;
 
   private canvas = $<HTMLCanvasElement>('canvas');
   private ctx = this.canvas.getContext('2d')!;
@@ -117,34 +154,159 @@ class Viewer {
       this.fillInfo();
       this.setupStackControls();
       this.setupLutOptions();
+      // The host follows init with page 0 unasked.
+      this.inFlight = 0;
     } else if (msg.type === 'slice') {
       this.onSlice(msg);
     } else if (msg.type === 'error') {
+      if (msg.index === undefined || msg.index === this.inFlight) {
+        this.inFlight = undefined;
+        // Move on if the controls have, but never straight back to the page
+        // that just failed - that would ask for it forever.
+        if (msg.index !== undefined && msg.index !== this.wantedIndex) this.fetchWanted();
+      }
       this.showError(msg.message, msg.fatal);
     }
   }
 
+  /**
+   * Keep up with the stack controls the way ImageJ's StackWindow does: at most
+   * one slice on its way at a time, and when it lands, ask for wherever the
+   * controls are by then, skipping every page they passed on the way.
+   *
+   * Asking for every value a drag passes through queues a decode and a
+   * transfer per value. A 4096x4096 float32 slice is 64 MB, so the image
+   * trailed the slider by seconds and kept moving long after the hand stopped.
+   */
+  private fetchWanted(upgrade = false) {
+    if (this.inFlight !== undefined) return;
+    if (this.wantedIndex !== this.sliceIndex) {
+      const step = this.previewStep();
+      this.request(this.wantedIndex, step, this.previewRegion(step));
+    } else if (upgrade && this.isPreview()) {
+      this.request(this.sliceIndex, 1);
+    }
+  }
+
+  private readAhead() {
+    const next = this.sliceIndex + this.lastStride;
+    if (this.lastStride === 0 || next < 0 || next >= (this.init?.pageCount ?? 0)) return;
+    vscode.postMessage({ type: 'prefetch', index: next });
+  }
+
+  private request(index: number, step: number, region?: Region) {
+    this.inFlight = index;
+    const msg: { type: string; index: number; step?: number; region?: Region; encoding?: PixelEncoding } =
+      { type: 'requestSlice', index };
+    if (step > 1) msg.step = step;
+    if (region) msg.region = region;
+    if (this.encoding !== 'binary') msg.encoding = this.encoding;
+    vscode.postMessage(msg);
+  }
+
+  private isPreview(): boolean { return this.shownStep > 1 || this.shownRegion !== undefined; }
+
+  private previewable(): boolean {
+    return this.width * this.height * this.samplesPerPixel * elementSize(this.dtype) >= PREVIEW_MIN_BYTES;
+  }
+
+  /**
+   * Zoomed in, only the part of the slice in view is sent while the stack
+   * moves - at 100% in an ordinary window that is a few percent of a 4096x4096
+   * slice. A margin keeps a small pan from uncovering blank edges before the
+   * whole slice arrives. Undefined when most of the slice is in view anyway.
+   */
+  private previewRegion(step: number): Region | undefined {
+    if (!this.previewable()) return undefined;
+    const dpr = window.devicePixelRatio || 1;
+    const vw = this.canvas.width / dpr;
+    const vh = this.canvas.height / dpr;
+    const mx = vw / 8;
+    const my = vh / 8;
+    // On the sampling grid, so a region and the whole slice sample alike.
+    const down = (v: number) => Math.floor(v / step) * step;
+    const x0 = clamp(down((-mx - this.offsetX) / this.zoom), 0, this.width);
+    const y0 = clamp(down((-my - this.offsetY) / this.zoom), 0, this.height);
+    const x1 = clamp(Math.ceil((vw + mx - this.offsetX) / this.zoom), 0, this.width);
+    const y1 = clamp(Math.ceil((vh + my - this.offsetY) / this.zoom), 0, this.height);
+    const width = x1 - x0;
+    const height = y1 - y0;
+    if (width <= 0 || height <= 0 || width * height > 0.5 * this.width * this.height) return undefined;
+    return { x: x0, y: y0, width, height };
+  }
+
+  /**
+   * How coarsely a slice can be sampled while the stack is moving and still
+   * draw the same: one sample per device pixel. At fit-to-window a 4096-pixel
+   * slice lands on a fraction of that many, so most of its 64 MB would be
+   * shipped across two process boundaries only for the GPU to drop it.
+   */
+  private previewStep(): number {
+    if (!this.previewable()) return 1;
+    const dpr = window.devicePixelRatio || 1;
+    return clamp(Math.floor(1 / (this.zoom * dpr)), 1, MAX_PREVIEW_STEP);
+  }
+
+  /**
+   * Once the controls have been still for a moment, swap a preview for the
+   * whole slice, which pixel readout, zooming in and Save PNG need. Waiting
+   * keeps a 64 MB transfer from getting in the way of the next step.
+   */
+  private scheduleUpgrade() {
+    if (this.upgradeTimer !== undefined) clearTimeout(this.upgradeTimer);
+    this.upgradeTimer = undefined;
+    if (!this.isPreview()) return;
+    this.upgradeTimer = setTimeout(() => {
+      this.upgradeTimer = undefined;
+      this.fetchWanted(true);
+    }, SETTLE_MS);
+  }
+
   private onSlice(msg: SlicePayload) {
+    if (msg.index === this.inFlight) this.inFlight = undefined;
+    const bytes = payloadBytes(msg);
+    if (!bytes) {
+      // The transport mangled the binary, so ask again as text from now on.
+      if (this.encoding === 'binary') {
+        this.encoding = 'base64';
+        this.fetchWanted();
+      } else {
+        this.showError(`Slice ${msg.index + 1} arrived without its pixels.`, this.sliceIndex < 0);
+      }
+      return;
+    }
+
+    const moved = msg.index !== this.sliceIndex;
     this.sliceIndex = msg.index;
+    this.shownStep = Math.max(1, msg.step || 1);
+    this.shownRegion = msg.region;
+    // Ask for the next page before drawing this one, so the host decodes it
+    // while this one is drawn rather than after.
+    this.fetchWanted();
+    // Nothing newer to ask for, so the host would sit idle until the next
+    // step: have it read ahead to where the stack is heading instead. Never
+    // during a drag, when there is always something newer and a read-ahead
+    // would only hold it up.
+    if (moved && this.inFlight === undefined) this.readAhead();
+    this.scheduleUpgrade();
+
     this.width = msg.width;
     this.height = msg.height;
     this.samplesPerPixel = msg.samplesPerPixel;
     this.dtype = msg.dtype;
-    this.data = viewOf(fromBase64(msg.base64), msg.dtype, msg.littleEndian);
+    this.data = viewOf(bytes, msg.dtype, msg.littleEndian);
+    const covered = msg.region ?? { width: msg.width, height: msg.height };
+    const size = sampledSize(covered.width, covered.height, this.shownStep);
+    this.surface = this.surfaceFor(size.width, size.height);
     this.stats = {
       ...msg.stats,
       histogram: Int32Array.from(msg.stats.histogram),
     } as Stats;
 
     const { channels } = this.init ? this.axisSizes() : { channels: 1 };
-    const first = !this.imageData || this.offscreen.width !== this.width || this.offscreen.height !== this.height;
-    if (first) {
-      this.offscreen.width = this.width;
-      this.offscreen.height = this.height;
-      this.imageData = this.offCtx.createImageData(this.width, this.height);
-      this.indices = new Uint8Array(this.width * this.height);
-      this.nanMask = new Uint8Array(this.width * this.height);
-    }
+    // The channel of the page that arrived, not of the controls: while they
+    // move, a reply can land for a channel they have already left.
+    const channel = this.shownChannel();
 
     this.fullRange = resetRange(this.stats!);
     const perSlice = ($('chk-per-slice') as HTMLInputElement).checked;
@@ -152,7 +314,7 @@ class Viewer {
     // ImageJ keeps one display range per channel, so a channel is "new" until
     // it has been shown once - otherwise a 0..100 channel would inherit the
     // 0..5000 range of the one before it and come out blank.
-    const remembered = channels > 1 ? this.channelRanges.get(this.axisC) : undefined;
+    const remembered = channels > 1 ? this.channelRanges.get(channel) : undefined;
     const neverSeen = channels > 1 ? remembered === undefined : !this.hasRange;
 
     if (perSlice || neverSeen) {
@@ -165,7 +327,7 @@ class Viewer {
         // would leave every slice at a different level saturated the moment the
         // range is held - which is the whole point of holding it.
         // Each channel gets its own, as it keeps its own range.
-        const wholeStack = perSlice ? undefined : this.init.stackAuto?.[channels > 1 ? this.axisC : 0];
+        const wholeStack = perSlice ? undefined : this.init.stackAuto?.[channel];
         if (wholeStack) {
           this.range = { ...wholeStack };
           this.autoThreshold = 0;
@@ -183,7 +345,7 @@ class Viewer {
     }
     // else: single-channel stack, keep whatever range the user has set.
 
-    if (channels > 1) this.channelRanges.set(this.axisC, this.range);
+    if (channels > 1) this.channelRanges.set(channel, this.range);
 
     this.hideError();
     if (!this.userHasZoomed) this.fitToWindow();
@@ -191,27 +353,48 @@ class Viewer {
     this.fillStats();
     this.pixelsDirty = true;
     this.scheduleDraw();
+    // The readout describes the slice now on screen, as far as it can.
+    if (this.lastPointer) this.updateReadout(this.lastPointer.x, this.lastPointer.y);
   }
 
   private hasRange = false;
 
+  private surfaceFor(width: number, height: number): Surface {
+    const preview = this.isPreview();
+    const hit = preview ? this.previewSurface : this.fullSurface;
+    if (hit && hit.canvas.width === width && hit.canvas.height === height) return hit;
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d', { willReadFrequently: false })!;
+    const s: Surface = {
+      canvas, ctx,
+      image: ctx.createImageData(width, height),
+      indices: new Uint8Array(width * height),
+      mask: new Uint8Array(width * height),
+    };
+    if (preview) this.previewSurface = s; else this.fullSurface = s;
+    return s;
+  }
+
   // ---- rendering ---------------------------------------------------------
   private renderPixels() {
-    if (!this.data || !this.imageData) return;
-    const rgba = this.imageData.data;
+    const s = this.surface;
+    if (!this.data || !s) return;
+    const rgba = s.image.data;
     if (this.samplesPerPixel >= 3) {
       renderColor(this.data, this.samplesPerPixel, this.range.min, this.range.max, rgba);
     } else {
       // The statistics pass already counted NaN/Inf, so the common case skips
       // the per-pixel finiteness test and the mask entirely.
       const clean = (this.stats?.nonFiniteCount ?? 0) === 0;
-      mapTo8Bit(this.data, this.range.min, this.range.max, this.indices, {
+      mapTo8Bit(this.data, this.range.min, this.range.max, s.indices, {
         assumeFinite: clean,
-        mask: clean ? undefined : this.nanMask,
+        mask: clean ? undefined : s.mask,
       });
-      composeRGBA(this.indices, getLut(this.lutName), rgba, clean ? undefined : this.nanMask, [255, 64, 64]);
+      composeRGBA(s.indices, getLut(this.lutName), rgba, clean ? undefined : s.mask, [255, 64, 64]);
     }
-    this.offCtx.putImageData(this.imageData, 0, 0);
+    s.ctx.putImageData(s.image, 0, 0);
   }
 
   private pixelsDirty = false;
@@ -227,6 +410,10 @@ class Viewer {
         this.drawHistogram();
       }
       this.draw();
+      if (this.pendingSave !== undefined && this.pendingSave === this.sliceIndex && !this.isPreview()) {
+        this.pendingSave = undefined;
+        this.savePng();
+      }
     });
   }
 
@@ -252,11 +439,18 @@ class Viewer {
     this.ctx.clearRect(0, 0, vw, vh);
     // Never interpolate: smoothing invents pixel values that were not measured.
     this.ctx.imageSmoothingEnabled = false;
-    this.ctx.drawImage(
-      this.offscreen, 0, 0, this.width, this.height,
-      Math.round(this.offsetX), Math.round(this.offsetY),
-      this.width * this.zoom, this.height * this.zoom,
-    );
+    const s = this.surface;
+    if (s) {
+      // A preview's pixels each stand for a step x step block of the slice,
+      // starting where its region does.
+      const k = this.shownStep * this.zoom;
+      const r = this.shownRegion;
+      this.ctx.drawImage(
+        s.canvas, 0, 0, s.canvas.width, s.canvas.height,
+        Math.round(this.offsetX + (r ? r.x * this.zoom : 0)), Math.round(this.offsetY + (r ? r.y * this.zoom : 0)),
+        s.canvas.width * k, s.canvas.height * k,
+      );
+    }
     $('zoom-label').textContent = `${formatZoom(this.zoom)}  (${this.width}×${this.height})`;
   }
 
@@ -359,6 +553,12 @@ class Viewer {
     return { channels, slices, frames };
   }
 
+  /** Channel of the page on screen; channels come fastest in ImageJ's page order. */
+  private shownChannel(): number {
+    const channels = this.init ? this.axisSizes().channels : 1;
+    return channels > 1 ? Math.max(0, this.sliceIndex) % channels : 0;
+  }
+
   /** ImageJ's default hyperstack page order is c fastest, then z, then t. */
   private pageIndex(): number {
     const { channels, slices } = this.axisSizes();
@@ -373,10 +573,11 @@ class Viewer {
     if (frames > 1) parts.push(`t ${this.axisT + 1}/${frames}`);
 
     // For a multi-file stack the member's own name says far more than a page number.
+    // The label follows the controls, so it answers a drag at once.
     const seq = this.init!.sequence;
     const tail = seq
-      ? seq.labels[this.sliceIndex] ?? ''
-      : `(page ${this.sliceIndex + 1}/${this.init!.pageCount})`;
+      ? seq.labels[this.wantedIndex] ?? ''
+      : `(page ${this.wantedIndex + 1}/${this.init!.pageCount})`;
 
     const el = $('slice-label');
     el.textContent = `${parts.join('   ')}   ${tail}`;
@@ -385,11 +586,16 @@ class Viewer {
 
   /** Move to the page implied by the current axis positions. */
   private requestCurrentPage() {
-    const idx = clamp(this.pageIndex(), 0, this.init!.pageCount - 1);
-    if (idx === this.sliceIndex) return;
-    this.sliceIndex = idx;
+    const next = clamp(this.pageIndex(), 0, this.init!.pageCount - 1);
+    if (next !== this.wantedIndex) {
+      this.pendingSave = undefined; // it was for the page left behind
+      this.lastStride = next - this.wantedIndex;
+    }
+    this.wantedIndex = next;
     this.updateSliceLabel();
-    vscode.postMessage({ type: 'requestSlice', index: idx });
+    this.fetchWanted();
+    // Still moving: hold off replacing the preview on screen.
+    this.scheduleUpgrade();
   }
 
   private setupLutOptions() {
@@ -491,7 +697,7 @@ class Viewer {
   private applyRange(next: Range, resync = true) {
     this.range = next;
     const multiChannel = !!this.init && this.axisSizes().channels > 1;
-    if (multiChannel) this.channelRanges.set(this.axisC, next);
+    if (multiChannel) this.channelRanges.set(this.shownChannel(), next);
     this.pixelsDirty = true;
     if (resync) this.syncControls();
     this.scheduleDraw();
@@ -632,7 +838,7 @@ class Viewer {
       dragging = false;
       try { canvas.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
     });
-    canvas.addEventListener('pointerleave', () => { $('pos').innerHTML = '&nbsp;'; });
+    canvas.addEventListener('pointerleave', () => { this.lastPointer = undefined; $('pos').innerHTML = '&nbsp;'; });
     canvas.addEventListener('pointermove', e => {
       if (dragging) {
         this.offsetX += e.offsetX - lastX;
@@ -651,12 +857,18 @@ class Viewer {
   }
 
   private updateReadout(px: number, py: number) {
+    this.lastPointer = { x: px, y: py };
     if (!this.data) return;
     const x = Math.floor((px - this.offsetX) / this.zoom);
     const y = Math.floor((py - this.offsetY) / this.zoom);
     if (x < 0 || y < 0 || x >= this.width || y >= this.height) { $('pos').innerHTML = '&nbsp;'; return; }
+    // Where the data on screen does not hold this very pixel - a sampled
+    // preview, or outside a cropped one - the value waits for the whole slice.
+    const r = this.shownRegion ?? { x: 0, y: 0, width: this.width, height: this.height };
+    const exact = this.shownStep === 1 && x >= r.x && y >= r.y && x < r.x + r.width && y < r.y + r.height;
+    if (!exact) { $('pos').textContent = `x=${x}, y=${y}`; return; }
     const isF = this.dtype === 'float32' || this.dtype === 'float64';
-    const base = (y * this.width + x) * this.samplesPerPixel;
+    const base = ((y - r.y) * r.width + (x - r.x)) * this.samplesPerPixel;
     let valueText: string;
     if (this.samplesPerPixel >= 3) {
       const parts = [];
@@ -704,10 +916,16 @@ class Viewer {
    * the host runs the save dialog.
    */
   private savePng() {
-    if (!this.width) return;
+    if (!this.width || !this.surface) return;
+    if (this.isPreview()) {
+      // A preview is on screen: save at full resolution once the whole slice is in.
+      this.pendingSave = this.sliceIndex;
+      this.fetchWanted(true);
+      return;
+    }
     let dataUrl: string;
     try {
-      dataUrl = this.offscreen.toDataURL('image/png');
+      dataUrl = this.surface.canvas.toDataURL('image/png');
     } catch (e) {
       this.showError(`Could not encode the image: ${(e as Error).message}`, false);
       return;
